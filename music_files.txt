@@ -1,0 +1,173 @@
+﻿
+===== electron\main.cjs =====
+
+const { app, BrowserWindow, ipcMain, dialog, shell, protocol, net } = require('electron');
+const { pathToFileURL } = require('url');
+
+// media:// lets the UI show local photos/videos (thumbnails in History/Preview)
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'media', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, bypassCSP: true } }
+]);
+const MEDIA_OK = /\.(jpe?g|png|gif|webp|bmp|mp4|mov|m4v|webm|avi|mkv)$/i;
+function mediaPathFromUrl(u) {
+  const p = decodeURIComponent(new URL(u).pathname.slice(1));
+  return MEDIA_OK.test(p) ? p : null;
+}
+function registerMedia() {
+  if (typeof protocol.handle === 'function') {
+    protocol.handle('media', (req) => {
+      const p = mediaPathFromUrl(req.url);
+      if (!p) return new Response('Forbidden', { status: 403 });
+      return net.fetch(pathToFileURL(p).toString());
+    });
+  } else {
+    protocol.registerFileProtocol('media', (req, cb) => {
+      const p = mediaPathFromUrl(req.url);
+      cb(p ? { path: p } : { error: -10 });
+    });
+  }
+}
+const path = require('path');
+app.setPath('userData', path.join(app.getPath('appData'), 'social-poster'));
+const { makeWindow } = require('./util.cjs');
+const { postAll } = require('./bots.cjs');
+
+const aITEa = {
+  facebook: 'https://www.facebook.com',
+  instagram: 'https://www.instagram.com',
+  tiktok: 'https://www.tiktok.com/login',
+  whatsapp: 'https://web.whatsapp.com',
+  youtube: 'https://studio.youtube.com',
+};
+const ORDER = ['facebook', 'instagram', 'tiktok', 'whatsapp', 'youtube'];
+let mainWin;
+
+function createWindow() {
+  mainWin = new BrowserWindow({
+    width: 1100,
+    height: 750,
+    webPreferences: { preload: path.join(__dirname, 'preload.cjs') },
+  });
+  if (app.isPackaged) {
+    mainWin.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
+  } else {
+    mainWin.loadURL('http://localhost:5173');
+  }
+}
+
+app.whenReady().then(() => { registerMedia(); createWindow(); });
+app.on('window-all-closed', () => app.quit());
+
+function openLoginElectron(name) {
+  return new Promise((resolve) => {
+    const win = makeWindow(name);
+    win.removeMenu();
+    win.on('closed', resolve);
+    win.loadURL(aITEa[name]).catch((err) => {
+      console.error(`${name} load error:`, err);
+      resolve();
+    });
+  });
+}
+
+ipcMain.handle('open-site', async (e, name) => {
+  if (aITEa[name]) await openLogin(name);
+});
+
+ipcMain.handle('login-all', async () => {
+  for (let i = 0; i < ORDER.length; i++) {
+    const name = ORDER[i];
+    mainWin.webContents.send('login-step', `${i + 1}/${ORDER.length}: ${name} mein login karein, phir ye window band kar dein`);
+    await openLogin(name);
+  }
+  mainWin.webContents.send('login-step', 'aab login ho gaye. lb Post kar sakte hain.');
+  return true;
+});
+
+ipcMain.handle('pick-file', async () => {
+  const r = await dialog.showOpenDialog({
+    properties: ['openFile'],
+    filters: [{ name: 'Photo/Video', extensions: ['jpg', 'jpeg', 'png', 'mp4', 'mov'] }],
+  });
+  return r.canceled ? null : r.filePaths[0];
+});
+
+ipcMain.handle('post-all', async (e, data) => {
+  if (data.dryRun) return { results: data.platforms.map((p) => ({ ok: true, message: p + ': TEaT MODE - asli post nahi hui' })) };
+  const caption = [data.text, data.description].filter(Boolean).join('\n\n');
+  const results = await postAll(caption, data.file, data.platforms);
+  return { results };
+});
+
+// YouTube ka login asli Chrome me (Google app ki window me login block karta hai)
+function openYoutubeChrome() {
+  return new Promise((resolve) => {
+    let chrome;
+    try { chrome = require('./chrome.cjs'); } catch (e) { return resolve(); }
+    if (!chrome.CHROME) return resolve();
+    try { chrome.killProfileChrome(); } catch (e) {}
+    setTimeout(() => {
+      const { spawn } = require('child_process');
+      const child = spawn(chrome.CHROME, [
+        '--user-data-dir=' + chrome.PROFILE,
+        '--disable-background-mode', '--no-first-run', '--no-default-browser-check',
+        '--new-window', aITEa.youtube,
+      ], { stdio: 'ignore' });
+      child.on('exit', () => resolve());
+      child.on('error', () => resolve());
+    }, 1500);
+  });
+}
+
+function openLogin(name) {
+  if (name === 'youtube') return openYoutubeChrome();
+  return openLoginElectron(name);
+}
+ipcMain.handle('pick-files', async () => {
+  const r = await dialog.showOpenDialog({
+    properties: ['openFile', 'multiSelections'],
+    filters: [{ name: 'Photo/Video', extensions: ['jpg', 'jpeg', 'png', 'mp4', 'mov'] }],
+  });
+  return r.canceled ? [] : r.filePaths;
+});
+
+ipcMain.handle('post-batch', async (e, data) => {
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const out = [];
+  for (let i = 0; i < data.items.length; i++) {
+    const it = data.items[i];
+    mainWin.webContents.send('batch-progress', { index: i, status: 'uploading' });
+    let results;
+    try {
+      if (data.dryRun) {
+        results = (it.platforms || data.platforms).map((p) => ({ ok: true, message: p + ': TEST MODE - asli post nahi hui' }));
+      } else {
+        const caption = [it.text, data.description].filter(Boolean).join('\n\n');
+        results = await postAll(caption, it.files || it.file, (it.platforms || data.platforms));
+      }
+    } catch (err) {
+      results = [{ ok: false, message: 'error - ' + err.message }];
+    }
+    const ok = results.every((r) => r.ok);
+    mainWin.webContents.send('batch-progress', { index: i, status: ok ? 'done' : 'failed', results });
+    out.push({ index: i, file: it.file, ok, results });
+    await wait(3000);
+  }
+  return { items: out };
+});
+
+===== electron\preload.cjs =====
+
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('api', {
+  postAll: (data) => ipcRenderer.invoke('post-all', data),
+  openSite: (name) => ipcRenderer.invoke('open-site', name),
+  pickFile: () => ipcRenderer.invoke('pick-file'),
+  loginAll: () => ipcRenderer.invoke('login-all'),
+  onLoginStep: (cb) => ipcRenderer.on('login-step', (_e, msg) => cb(msg)),
+  pickFiles: () => ipcRenderer.invoke('pick-files'),
+  postBatch: (data) => ipcRenderer.invoke('post-batch', data),
+  onBatchProgress: (cb) => ipcRenderer.on('batch-progress', (_e, msg) => cb(msg)),
+});
+

@@ -1,0 +1,688 @@
+﻿
+===== D:\projects\social-poster\electron\tiktok.cjs =====
+
+const { sleep, makeWindow, waitFor, clickText, setFile, ensureLogin } = require('./util.cjs');
+
+async function postToTikTok(text, file) {
+  if (!file) return { ok: false, message: 'TikTok: photo ya video choose karein' };
+  const isImage = /\.(png|jpe?g|webp)$/i.test(file);
+  const win = makeWindow('tiktok');
+  win.webContents.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + process.versions.chrome.split('.')[0] + '.0.0.0 Safari/537.36');
+  try {
+    await ensureLogin(win, isImage ? 'https://www.tiktok.com/tiktokstudio/upload?tab=photo' : 'https://www.tiktok.com/tiktokstudio/upload');
+
+    if (!(await waitFor(win, `!!document.querySelector('input[type="file"]')`, 30000)))
+      return { ok: false, message: 'TikTok: upload box nahi mila' };
+    if (!(await setFile(win, 'input[type="file"]', file)))
+      return { ok: false, message: 'TikTok: file attach nahi hui' };
+
+    const BIGBOX = `(function(){ const els=[...document.querySelectorAll('.public-DraftEditor-content, div[contenteditable="true"]')].filter(e=>e.offsetParent!==null); if(!els.length) return null; els.sort((a,b)=>b.getBoundingClientRect().height-a.getBoundingClientRect().height); return els[0]; })()`;
+
+    const found = await waitFor(win, `
+      (function () {
+        const el = ${BIGBOX};
+        if (!el) return false;
+        el.scrollIntoView({ block: 'center' });
+        el.focus();
+        return true;
+      })();
+    `, 90000);
+    if (!found) return { ok: false, message: 'TikTok: caption box nahi mila' };
+    await sleep(1050);
+
+    const wc = win.webContents;
+    await wc.executeJavaScript(`(function(){ const el=${BIGBOX}; if(el){ el.focus(); document.execCommand('selectAll'); document.execCommand('delete'); } return true; })();`);
+    await sleep(500);
+
+    const lines = String(text || '').split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i]) await wc.insertText(lines[i]);
+      if (i < lines.length - 1) {
+        wc.sendInputEvent({ type: 'keyDown', keyCode: 'Enter' });
+        wc.sendInputEvent({ type: 'char', keyCode: 'Enter' });
+        wc.sendInputEvent({ type: 'keyUp', keyCode: 'Enter' });
+        await sleep(200);
+      }
+    }
+    await sleep(700);
+
+    const clicked = await waitFor(win, `
+      (function () {
+        const b = [...document.querySelectorAll('button')].find(e =>
+          /^post$/i.test((e.innerText || '').trim()) &&
+          !e.disabled && e.getAttribute('aria-disabled') !== 'true' && e.getAttribute('data-disabled') !== 'true');
+        if (!b) return false;
+        b.click();
+        return true;
+      })();
+    `, 240000);
+    if (!clicked) return { ok: false, message: 'TikTok: Post button enable nahi hua' };
+
+    await sleep(1050);
+    await clickText(win, '^post now$');
+    const done = await waitFor(win, `/uploaded|manage your posts|video is being processed|posted|view post/i.test(document.body.innerText) || location.href.includes('/content')`, 60000);
+    return done
+      ? { ok: true, message: 'TikTok: post ho gayi' }
+      : { ok: false, message: 'TikTok: Post dabaya, Studio ke Posts me check karein' };
+  } finally {
+    await sleep(700);
+    win.close();
+  }
+}
+
+module.exports = { postToTikTok };
+
+
+===== D:\projects\social-poster\electron\util.cjs =====
+
+const { BrowserWindow, session } = require('electron');
+
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function makeWindow(name) {
+  const ses = session.fromPartition('persist:' + name);
+
+  // Extra settings to look more like real Chrome
+  ses.setUserAgent(UA);
+
+  const win = new BrowserWindow({
+    width: 1200,
+    height: 800,
+    show: true,
+    webPreferences: {
+      partition: 'persist:' + name,
+      nodeIntegration: false,
+      contextIsolation: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+    },
+  });
+
+  // Real Chrome jaisa user agent
+  win.webContents.setUserAgent(UA);
+
+  // Extra headers
+  win.webContents.session.webRequest.onBeforeSendHeaders((details, callback) => {
+    details.requestHeaders['User-Agent'] = UA;
+    details.requestHeaders['Accept-Language'] = 'en-US,en;q=0.9';
+    callback({ requestHeaders: details.requestHeaders });
+  });
+
+  return win;
+}
+
+async function waitFor(win, js, ms = 30000) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    try {
+      if (await win.webContents.executeJavaScript(js)) return true;
+    } catch (e) {}
+    await sleep(400);
+  }
+  return false;
+}
+
+function clickText(win, pattern, sel = 'div[role="button"], button, a') {
+  return win.webContents.executeJavaScript(`
+    (function () {
+      const re = new RegExp(${JSON.stringify(pattern)}, 'i');
+      const el = [...document.querySelectorAll(${JSON.stringify(sel)})]
+        .find(e => re.test((e.innerText || '').trim()));
+      if (!el) return false;
+      el.click();
+      return true;
+    })();
+  `);
+}
+
+async function setFile(win, selector, filePath) {
+  const dbg = win.webContents.debugger;
+  if (!dbg.isAttached()) dbg.attach('1.3');
+  const { root } = await dbg.sendCommand('DOM.getDocument', { depth: -1 });
+  const { nodeId } = await dbg.sendCommand('DOM.querySelector', {
+    nodeId: root.nodeId,
+    selector,
+  });
+  if (!nodeId) return false;
+  await dbg.sendCommand('DOM.setFileInputFiles', { nodeId, files: [filePath] });
+  return true;
+}
+
+async function ensureLogin(win, url) {
+  await win.loadURL(url);
+  await sleep(2100);
+  let waited = false;
+  for (let i = 0; i < 90; i++) {
+    const needs = await win.webContents
+      .executeJavaScript(`!!document.querySelector('input[type="password"]') || /\\/login/i.test(location.href)`)
+      .catch(() => true);
+    if (!needs) break;
+    waited = true;
+    await sleep(700);
+  }
+  if (waited) {
+    await win.loadURL(url);
+    await sleep(2100);
+  }
+}
+
+module.exports = { UA, sleep, makeWindow, waitFor, clickText, setFile, ensureLogin };
+
+
+===== D:\projects\social-poster\electron\whatsapp.cjs =====
+
+const { sleep, makeWindow } = require('./util.cjs');
+
+const CHANNEL_NAME = 'Makhdoom Brothers Podcast';
+// Broadcast lists (disabled: only the Channel is used)
+const BROADCAST_LISTS = [];
+
+const run = (win, code) => win.webContents.executeJavaScript(code, true);
+
+async function waitFor(win, expr, label, timeout = 20000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) {
+    try {
+      if (await run(win, `(() => { try { return !!(${expr}); } catch { return false; } })()`)) return;
+    } catch {}
+    await sleep(500);
+  }
+  throw new Error('Nahi mila: ' + label);
+}
+
+const clickAny = (win, selectors) => run(win, `(() => {
+  for (const s of ${JSON.stringify(selectors)}) {
+    const el = document.querySelector(s);
+    if (el) { (el.closest('button,[role="button"]') || el).click(); return true; }
+  }
+  return false;
+})()`);
+
+async function realClickAt(win, pos) {
+  const wc = win.webContents;
+  wc.sendInputEvent({ type: 'mouseMove', x: pos.x, y: pos.y });
+  await sleep(150);
+  wc.sendInputEvent({ type: 'mouseDown', x: pos.x, y: pos.y, button: 'left', clickCount: 1 });
+  await sleep(80);
+  wc.sendInputEvent({ type: 'mouseUp', x: pos.x, y: pos.y, button: 'left', clickCount: 1 });
+}
+
+async function realClickByText(win, name) {
+  const pos = await run(win, `(() => {
+    const name = ${JSON.stringify(name)};
+    const el = [...document.querySelectorAll('span[title], span')]
+      .find(e => (e.getAttribute('title') || e.textContent || '').trim().startsWith(name)
+                 && !e.closest('[contenteditable]')
+                 && e.getBoundingClientRect().left < 500
+                 && e.getBoundingClientRect().width > 0);
+    if (!el) return null;
+    el.scrollIntoView({ block: 'center' });
+    const r = el.getBoundingClientRect();
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+  })()`);
+  if (!pos) return false;
+  await realClickAt(win, pos);
+  return true;
+}
+
+const SEND_FIND = `(() => {
+  const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let el = [...document.querySelectorAll('[data-icon*="send"], [aria-label="Send"], [aria-label="send"]')].find(vis);
+  if (el) el = el.closest('button,[role="button"]') || el;
+  if (!el) {
+    el = [...document.querySelectorAll('button,[role="button"]')].filter(vis).filter(b => {
+      const r = b.getBoundingClientRect();
+      return r.width >= 40 && r.width <= 80 && Math.abs(r.width - r.height) < 6
+        && r.bottom > innerHeight - 200 && r.right > innerWidth - 150;
+    }).sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right)[0];
+  }
+  if (!el) return null;
+  const r = el.getBoundingClientRect();
+  return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+})()`;
+
+function findBoxJs(inFooter) {
+  return `(() => {
+    const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    const boxes = [...document.querySelectorAll('[contenteditable="true"]')]
+      .filter(vis)
+      .filter(b => !b.closest('#side') && !b.closest('#pane-side'))
+      .filter(b => b.getBoundingClientRect().left > 400)
+      .filter(b => ${inFooter ? '!!b.closest("footer")' : '!b.closest("footer")'});
+    const b = boxes[boxes.length - 1];
+    if (!b) return null;
+    const r = b.getBoundingClientRect();
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+  })()`;
+}
+
+// Finds the caption box in the media preview (outside or inside the footer)
+const CAPTION_FIND = `(() => {
+  const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const all = [...document.querySelectorAll('[contenteditable="true"]')]
+    .filter(vis)
+    .filter(b => !b.closest('#side') && !b.closest('#pane-side'))
+    .filter(b => b.getBoundingClientRect().left > 300);
+  let b = all.find(x => /caption/i.test((x.getAttribute('aria-label') || '') + ' ' + (x.getAttribute('data-tab') || '') + ' ' + (x.getAttribute('title') || '')));
+  if (!b) b = all.filter(x => !x.closest('footer'))[all.filter(x => !x.closest('footer')).length - 1];
+  if (!b) b = all[all.length - 1];
+  if (!b) return null;
+  const r = b.getBoundingClientRect();
+  return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+})()`;
+async function typeText(win, pos, text) {
+  await realClickAt(win, pos);
+  await sleep(400);
+  const wc = win.webContents;
+  wc.selectAll();
+  await sleep(100);
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i]) await wc.insertText(lines[i]);
+    if (i < lines.length - 1) {
+      wc.sendInputEvent({ type: 'keyDown', keyCode: 'Enter', modifiers: ['shift'] });
+      wc.sendInputEvent({ type: 'keyUp', keyCode: 'Enter', modifiers: ['shift'] });
+      await sleep(60);
+    }
+  }
+}
+
+async function clickSend(win) {
+  const pos = await run(win, SEND_FIND);
+  if (pos) { await realClickAt(win, pos); return; }
+  const wc = win.webContents;
+  wc.sendInputEvent({ type: 'keyDown', keyCode: 'Enter' });
+  wc.sendInputEvent({ type: 'keyUp', keyCode: 'Enter' });
+}
+
+// ---- Channel kholna ----
+async function openChannel(win) {
+  const sel = [
+    'button[aria-label="Channels"]',
+    '[aria-label="Channels"]',
+    '[data-navbar-item="channels"]',
+    '[data-icon*="newsletter"]',
+    '[data-icon*="channel"]',
+    'button[aria-label="Updates"]',
+    '[aria-label="Updates"]',
+    '[aria-label*="Updates"]',
+    '[data-navbar-item="updates"]',
+    '[data-icon*="status"]'
+  ];
+  if (!(await clickAny(win, sel))) throw new Error('Channels icon not found');
+  let found = false;
+  for (let i = 0; i < 8; i++) {
+    await sleep(1500);
+    if (await realClickByText(win, CHANNEL_NAME)) { found = true; break; }
+  }
+  if (!found) {
+    const seen = await run(win, `(() => [...document.querySelectorAll('span[title], span')]
+      .filter(e => e.getBoundingClientRect().left < 500 && e.getBoundingClientRect().width > 0 && e.children.length === 0)
+      .map(e => (e.getAttribute('title') || e.textContent || '').trim())
+      .filter(Boolean).slice(0, 60))()`);
+    console.log('[whatsapp] left panel texts:', JSON.stringify(seen));
+    throw new Error('Channel "' + CHANNEL_NAME + '" was not found in the list');
+  }
+  await sleep(1500);
+}
+
+// ---- Chats tab se naam search karke chat/broadcast list kholna ----
+async function openChatByName(win, name) {
+  const tab = [
+    'button[aria-label="Chats"]',
+    '[aria-label="Chats"]',
+    '[data-navbar-item="chats"]',
+    '[data-icon="chats-filled"]',
+    '[data-icon="chats-outline"]',
+    '[data-icon*="chats"]'
+  ];
+  if (!(await clickAny(win, tab))) throw new Error('Chats tab not found');
+  await sleep(1500);
+
+  const sp = await run(win, `(() => {
+    const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    const b = [...document.querySelectorAll('input[type="text"], input[type="search"], [role="textbox"], [contenteditable="true"]')]
+      .filter(vis)
+      .filter(e => !e.closest('footer') && e.getBoundingClientRect().left < 500)[0];
+    if (!b) return null;
+    const r = b.getBoundingClientRect();
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+  })()`);
+  if (!sp) throw new Error('Search box nahi mila');
+  await realClickAt(win, sp);
+  await sleep(400);
+  win.webContents.selectAll();
+  await sleep(100);
+  await win.webContents.insertText(name);
+  await sleep(2500);
+
+  if (!(await realClickByText(win, name))) {
+    throw new Error('"' + name + '" was not found. Check the list name and make sure it exists on your phone.');
+  }
+  await sleep(1500);
+}
+
+// ---- jo chat khuli hai us mein file + description bhejna ----
+async function sendInOpenChat(win, ctx, filePath, caption) {
+  ctx.step = 'message box';
+  await waitFor(win, `(${findBoxJs(true)}) !== null`, 'message/update box');
+  await sleep(800);
+
+  let captionDone = false;
+
+  if (filePath) {
+    ctx.step = 'file attach';
+    const opened = await clickAny(win, [
+      'footer button[aria-label="Attach"]',
+      'footer [data-icon="plus-rounded"]',
+      'footer [data-icon="plus"]',
+      'footer [data-icon="attach-menu-plus"]',
+      'footer [data-icon*="attach"]'
+    ]);
+    if (!opened) throw new Error('Attach button nahi mila');
+    await sleep(1500);
+    const dbg = win.webContents.debugger;
+    if (!dbg.isAttached()) dbg.attach('1.3');
+    await dbg.sendCommand('Page.enable');
+    await dbg.sendCommand('DOM.enable');
+    await dbg.sendCommand('Page.setInterceptFileChooserDialog', { enabled: true });
+    const chooser = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('File chooser did not open')), 15000);
+      const handler = (ev, method, params) => {
+        if (method === 'Page.fileChooserOpened') {
+          clearTimeout(timer);
+          dbg.removeListener('message', handler);
+          resolve(params);
+        }
+      };
+      dbg.on('message', handler);
+    });
+    chooser.catch(() => {});
+    let picked = false;
+    {
+      const pos = await run(win, `(() => {
+        const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+        const els = [...document.querySelectorAll('[aria-label],li,button,[role="button"],[role="menuitem"],span,div')].filter(vis)
+          .filter(e => (e.getAttribute('aria-label') || '') === 'Photos & videos' || (e.innerText || '').trim() === 'Photos & videos');
+        const el = els[0];
+        if (!el) return null;
+        const t = el.closest('li,button,[role="button"],[role="menuitem"]') || el;
+        const r = t.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })()`);
+      if (pos) { await realClickAt(win, pos); picked = true; }
+    }
+    if (!picked) picked = await realClickByText(win, 'Photos');
+    if (!picked) {
+      const items = await run(win, `[...document.querySelectorAll('[role="menuitem"],[role="button"],li,button,span')].filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.left > 300; }).map(e => ((e.getAttribute('aria-label') || '') + ' | ' + (e.innerText || '')).trim().slice(0, 40)).filter(Boolean)`);
+      require('fs').writeFileSync(require('path').join(__dirname, '..', 'wa_menu.txt'), JSON.stringify(items, null, 1));
+      throw new Error('Photos & videos option not found in attach menu');
+    }
+    const fc = await chooser;
+    await dbg.sendCommand('DOM.setFileInputFiles', { files: [filePath], backendNodeId: fc.backendNodeId });
+    try { await dbg.sendCommand('Page.setInterceptFileChooserDialog', { enabled: false }); } catch {}
+    try { dbg.detach(); } catch {}
+
+    ctx.step = 'preview (send button)';
+    await waitFor(win, `(${SEND_FIND}) !== null`, 'preview send button', 30000);
+    await sleep(2000);
+
+    ctx.step = 'description (preview)';
+    const capPos = await run(win, CAPTION_FIND);
+    if (capPos) {
+      await typeText(win, capPos, caption);
+      captionDone = true;
+      await sleep(800);
+    }
+
+    ctx.step = 'sending file';
+    await clickSend(win);
+    await sleep(5000);
+  }
+
+  if (!captionDone) {
+    ctx.step = 'sending description as separate message';
+    await waitFor(win, `(${findBoxJs(true)}) !== null`, 'message box (for description)');
+    const boxPos = await run(win, findBoxJs(true));
+    await typeText(win, boxPos, caption);
+    await sleep(800);
+    await clickSend(win);
+    await sleep(4000);
+  }
+}
+
+async function pressEsc(win) {
+  const wc = win.webContents;
+  for (let i = 0; i < 2; i++) {
+    wc.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
+    wc.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
+    await sleep(300);
+  }
+}
+
+async function postToWhatsAppChannel(text, file) {
+  const win = makeWindow('whatsapp');
+  const filePath = typeof file === 'string' ? file : file && file.path;
+  const caption = String(text || '').replace(/\*\*(.+?)\*\*/g, '*$1*').trim();
+  const ctx = { step: 'start' };
+
+  try {
+    if (!caption) throw new Error('The description is empty. Please add a description first.');
+
+    ctx.step = 'WhatsApp Web load';
+    await win.loadURL('https://web.whatsapp.com/');
+    try { win.show(); } catch {}
+
+    ctx.step = 'login (scan QR code)';
+    await waitFor(win,
+      `document.querySelector('#pane-side') || document.querySelector('[data-icon*="newsletter"]') || document.querySelector('[aria-label="Channels"]')`,
+      'WhatsApp login required. Scan the QR code with your phone, then try again.', 120000);
+    await sleep(1500);
+  } catch (e) {
+    return { ok: false, message: 'WhatsApp error (' + ctx.step + '): ' + e.message };
+  }
+
+  const targets = [
+    { label: 'Channel', open: () => openChannel(win) },
+    ...BROADCAST_LISTS.map(n => ({ label: n, open: () => openChatByName(win, n) }))
+  ];
+
+  const results = [];
+  for (let i = 0; i < targets.length; i++) {
+    const t = targets[i]; if (win.isDestroyed()) { results.push({ label: t.label, ok: false, err: "The WhatsApp window was closed. Please keep it open while posting." }); break; }
+    try {
+      ctx.step = 'opening ' + t.label;
+      await t.open();
+      await sendInOpenChat(win, ctx, filePath, caption);
+      results.push({ label: t.label, ok: true });
+    } catch (e) {
+      results.push({ label: t.label, ok: false, err: '(' + ctx.step + ') ' + e.message });
+      try { if (!win.isDestroyed()) await pressEsc(win); } catch {}
+    }
+    if (i < targets.length - 1) await sleep(6000 + Math.floor(Math.random() * 4000));
+  }
+
+  const ok = results.every(r => r.ok);
+  const message = results.map(r => r.ok ? r.label + ': posted' : r.label + ': ' + r.err).join(' | ');
+  return { ok, message };
+}
+
+module.exports = { postToWhatsAppChannel };
+
+
+
+
+
+
+
+
+
+===== D:\projects\social-poster\electron\youtube.cjs =====
+
+const fs = require('fs');
+const { spawn } = require('child_process');
+
+const DIR = 'C:\\SocialPosterData';
+const PORT = 9223;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function clean(s) { return String(s || '').replace(/\*\*/g, '').replace(/[<>]/g, ''); }
+
+async function postToYouTube(text, file) {
+  if (file && /\.(jpe?g|png)$/i.test(file)) {
+    const conv = await photoToVideo(file);
+    if (!conv.ok) return conv;
+    file = conv.path;
+  }
+  if (!file || !/\.(mp4|mov|webm)$/i.test(file))
+    return { ok: false, message: 'YouTube: sirf video choose karein (mp4, mov ya webm). Photo YouTube par upload nahi hoti.' };
+
+  let puppeteer, chrome;
+  try { puppeteer = require('puppeteer-core'); }
+  catch (e) { return { ok: false, message: 'YouTube: puppeteer-core is not installed. Run: cd D:\\projects\\makhdoom-postpro ; npm install puppeteer-core' }; }
+  try { chrome = require('./chrome.cjs'); }
+  catch (e) { return { ok: false, message: 'YouTube: electron\\chrome.cjs nahi mili' }; }
+  if (!chrome.CHROME) return { ok: false, message: 'YouTube: Google Chrome install nahi mila' };
+
+  let browser = null, page = null;
+  const fail = async (msg) => {
+    try { fs.mkdirSync(DIR, { recursive: true }); if (page) await page.screenshot({ path: DIR + '\\yt-fail.png' }); } catch (e) {}
+    return { ok: false, message: msg + ' (yt-fail.png dekhein)' };
+  };
+  const clickSel = (sel) => page.evaluate((s) => {
+    const e = document.querySelector(s);
+    if (!e) return false;
+    e.scrollIntoView({ block: 'center' });
+    e.click();
+    return true;
+  }, sel).catch(() => false);
+  const waitEnabled = (sel, ms) => page.waitForFunction((s) => {
+    const e = document.querySelector(s);
+    return !!e && !e.hasAttribute('disabled') && e.getAttribute('aria-disabled') !== 'true';
+  }, { timeout: ms, polling: 500 }, sel).then(() => true).catch(() => false);
+
+  try {
+    chrome.killProfileChrome();
+    await sleep(1500);
+    spawn(chrome.CHROME, [
+      '--user-data-dir=' + chrome.PROFILE,
+      '--remote-debugging-port=' + PORT,
+      '--disable-background-mode', '--disable-session-crashed-bubble', '--hide-crash-restore-bubble', '--no-first-run', '--no-default-browser-check',
+      '--new-window', '--start-minimized', 'about:blank',
+    ], { detached: true, stdio: 'ignore' }).unref();
+
+    for (let i = 0; i < 40 && !browser; i++) {
+      try { browser = await puppeteer.connect({ browserURL: 'http://127.0.0.1:' + PORT, defaultViewport: null }); }
+      catch (e) { await sleep(500); }
+    }
+    if (!browser) return { ok: false, message: 'YouTube: Chrome se connect nahi ho saka' };
+
+    const pages = await browser.pages();
+    page = pages[0] || await browser.newPage();
+    await page.bringToFront();
+    await page.goto('https://studio.youtube.com', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+
+    let chId = null;
+    for (let i = 0; i < 180 && !chId; i++) {
+      const m = page.url().match(/channel\/(UC[\w-]+)/);
+      if (m) chId = m[1]; else await sleep(1000);
+    }
+    if (!chId) return await fail('YouTube: Studio nahi khula ya login nahi hua. Pehle Login section se YouTube login karein');
+    await page.goto('https://studio.youtube.com/channel/' + chId + '/videos/upload?d=ud', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+    await sleep(1500);
+
+    const input = await page.waitForSelector('input[type="file"]', { timeout: 30000 }).catch(() => null);
+    if (!input) return await fail('YouTube: upload box nahi mila');
+    await input.uploadFile(file);
+
+    const lines = clean(text).split(/\r?\n/);
+    const title = (lines.map((l) => l.trim()).find((l) => l) || 'Video').slice(0, 95);
+
+    const titleBox = await page.waitForSelector('#title-textarea #textbox', { timeout: 90000 }).catch(() => null);
+    if (!titleBox) {
+      const limit = await page.evaluate(() => /upload limit|verify your account|daily upload/i.test(document.body.innerText)).catch(() => false);
+      return await fail(limit ? 'YouTube: daily upload limit ya account verification ka masla' : 'YouTube: title box nahi mila');
+    }
+    await page.evaluate((t) => {
+      const box = document.querySelector('#title-textarea #textbox');
+      box.focus();
+      document.execCommand('selectAll');
+      document.execCommand('insertText', false, t);
+    }, title);
+
+    if (text) {
+      await page.evaluate((ls) => {
+        const d = document.querySelector('#description-textarea #textbox');
+        if (!d) return false;
+        d.focus();
+        ls.forEach((l, i) => {
+          if (i > 0) { if (!document.execCommand('insertLineBreak')) document.execCommand('insertParagraph'); }
+          if (l) document.execCommand('insertText', false, l);
+        });
+        return true;
+      }, lines);
+    }
+    await sleep(700);
+
+    await clickSel('[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"]');
+    await sleep(500);
+    await clickSel('[name*="ALTERED_CONTENT_NO"]');
+    await sleep(500);
+
+    for (let i = 0; i < 3; i++) {
+      if (!(await waitEnabled('#next-button', 60000)))
+        return await fail('YouTube: Next button enable nahi hua (qadam ' + (i + 1) + ')');
+      await sleep(500);
+      await clickSel('#next-button');
+      await sleep(900);
+    }
+
+    await clickSel('[name="PUBLIC"]');
+    await sleep(700);
+
+    if (!(await waitEnabled('#done-button', 900000)))
+      return await fail('YouTube: Done button 15 minute tak enable nahi hua, upload poora nahi hua');
+    await sleep(800);
+    await clickSel('#done-button');
+
+    let confirmed = false;
+    for (let i = 0; i < 60; i++) {
+      await sleep(1000);
+      const ok = await page.evaluate(() =>
+        /video published|video uploaded|upload complete|video is now (live|public)/i.test(document.body.innerText) ||
+        !document.querySelector('ytcp-uploads-dialog')
+      ).catch(() => false);
+      if (ok) { confirmed = true; break; }
+    }
+    await clickSel('#close-button');
+    try { fs.mkdirSync(DIR, { recursive: true }); await page.screenshot({ path: DIR + '\\yt-after.png' }); } catch (e) {}
+    return confirmed
+      ? { ok: true, message: 'YouTube: video publish ho gayi (Studio mein check kar lein)' }
+      : await fail('YouTube: Done dabaya lekin confirm nahi aaya, Studio mein check karein');
+  } finally {
+    try { if (browser) await browser.disconnect(); } catch (e) {}
+    await sleep(2000);
+    try { chrome.killProfileChrome(); } catch (e) {}
+  }
+}
+
+function photoToVideo(img) {
+  return new Promise((resolve) => {
+    let ff;
+    try { ff = require('ffmpeg-static'); }
+    catch (e) { return resolve({ ok: false, message: 'YouTube: ffmpeg-static is not installed. Run: cd D:\\projects\\makhdoom-postpro ; npm install ffmpeg-static' }); }
+    try { fs.mkdirSync(DIR, { recursive: true }); } catch (e) {}
+    const out = DIR + '\\yt-photo.mp4';
+    const vf = 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p';
+    const args = ['-y', '-loop', '1', '-i', img, '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
+      '-t', '6', '-vf', vf, '-r', '30', '-c:v', 'libx264', '-tune', 'stillimage',
+      '-c:a', 'aac', '-shortest', '-movflags', '+faststart', out];
+    const pr = spawn(ff, args, { stdio: 'ignore' });
+    pr.on('error', () => resolve({ ok: false, message: 'YouTube: photo ko video banane me masla (ffmpeg chala nahi)' }));
+    pr.on('exit', (c) => resolve(c === 0 ? { ok: true, path: out } : { ok: false, message: 'YouTube: photo ko video banane me masla' }));
+  });
+}
+
+module.exports = { postToYouTube };

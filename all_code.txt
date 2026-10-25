@@ -1,0 +1,2768 @@
+﻿
+===== D:\projects\social-poster\electron\bots.cjs =====
+
+const { postToFacebook } = require('./facebook.cjs');
+const { postToInstagram } = require('./instagram.cjs');
+const { postToTikTok } = require('./tiktok.cjs');
+const { postToYouTube } = require('./youtube.cjs');
+const { postToWhatsAppChannel } = require('./whatsapp.cjs');
+
+const fail = (m) => ({ ok: false, message: m });
+const CONCURRENCY = 4;
+
+async function postOne(p, text, file) {
+  try {
+    if (p === 'facebook') return await postToFacebook(text, file);
+    if (p === 'instagram') return await postToInstagram(text, file);
+    if (p === 'tiktok') return await postToTikTok(text, file);
+    if (p === 'youtube') return await postToYouTube(text, file);
+if (p === 'whatsapp') return await postToWhatsAppChannel(text, file);	
+
+    if (p === 'whatsapp') {
+      return fail(
+        'WhatsApp Channel: automatic publishing is not configured yet. Open WhatsApp Web and post to your Channel manually.'
+      );
+    }
+
+    return fail(p + ': posting is not supported.');
+  } catch (e) {
+    return fail(p + ': error - ' + e.message);
+  }
+}
+
+async function postAll(text, file, platforms) {
+  const results = new Array(platforms.length);
+  let next = 0;
+
+  async function worker() {
+    while (next < platforms.length) {
+      const i = next++;
+      results[i] = await postOne(platforms[i], text, file);
+    }
+  }
+
+  const n = Math.min(CONCURRENCY, platforms.length);
+  await Promise.all(Array.from({ length: n }, worker));
+  return results;
+}
+
+module.exports = { postAll };
+
+===== D:\projects\social-poster\electron\chrome.cjs =====
+
+const fs = require('fs');
+const path = require('path');
+const { spawn, execFileSync } = require('child_process');
+
+const PROFILE = 'C:\\SocialPosterData\\chrome';
+fs.mkdirSync(PROFILE, { recursive: true });
+
+const CANDIDATES = [
+  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  path.join(process.env.LOCALAPPDATA || '', 'Google\\Chrome\\Application\\chrome.exe'),
+];
+const CHROME = CANDIDATES.find((p) => fs.existsSync(p));
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function ps(script) {
+  try {
+    return execFileSync('powershell', ['-NoProfile', '-Command', script]).toString().trim();
+  } catch (e) {
+    return '';
+  }
+}
+
+const FILTER = `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -like '*SocialPosterData*' }`;
+
+function countProfileChrome() {
+  return parseInt(ps(`(${FILTER} | Measure-Object).Count`), 10) || 0;
+}
+
+function killProfileChrome() {
+  ps(`${FILTER} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`);
+}
+
+function openSite(url) {
+  if (!CHROME) throw new Error('Chrome nahi mila');
+  killProfileChrome();
+  spawn(CHROME, ['--user-data-dir=' + PROFILE, '--disable-background-mode', url], { detached: true, stdio: 'ignore' }).unref();
+}
+
+// Chrome kholo aur jab tak is login folder ka koi bhi Chrome chal raha hai, intezar karo
+async function openAndWait(url) {
+  if (!CHROME) throw new Error('Chrome nahi mila');
+  killProfileChrome();
+  await sleep(1500);
+  spawn(CHROME, ['--user-data-dir=' + PROFILE, '--disable-background-mode', '--new-window', url], { detached: true, stdio: 'ignore' }).unref();
+  await sleep(6000);
+  while (countProfileChrome() > 0) await sleep(2000);
+}
+
+module.exports = { PROFILE, CHROME, openSite, openAndWait, killProfileChrome };
+
+===== D:\projects\social-poster\electron\facebook.cjs =====
+
+const { BrowserWindow, clipboard, nativeImage } = require('electron');
+const fs = require('fs');
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const DIR = 'C:\\SocialPosterData';
+
+async function shot(win, name) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const img = await win.webContents.capturePage();
+    fs.writeFileSync(DIR + '\\' + name + '.png', img.toPNG());
+  } catch (e) {}
+}
+
+function js(win, code) {
+  return win.webContents.executeJavaScript(code);
+}
+
+async function realClick(win, x, y) {
+  const wc = win.webContents;
+  wc.sendInputEvent({ type: 'mouseMove', x, y });
+  await sleep(250);
+  wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+  await sleep(80);
+  wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+}
+
+function dbgLog(msg) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    fs.appendFileSync(DIR + '\\fb-debug.txt', new Date().toLocaleTimeString() + '  ' + msg + '\r\n');
+  } catch (e) {}
+}
+
+async function hasPreview(win) {
+  return js(win, `
+    (function () {
+      const d = document.querySelector('div[role="dialog"]') || document.body;
+      if (d.querySelector('img[src^="blob:"], video[src^="blob:"]')) return true;
+      return !/add photos or videos/i.test(d.innerText || '');
+    })();
+  `).catch(() => false);
+}
+
+async function dropzonePos(win) {
+  return js(win, `
+    (function () {
+      const d = document.querySelector('div[role="dialog"]') || document;
+      const m = [...d.querySelectorAll('div[role="button"], div, span')]
+        .filter(e => /add photos or videos/i.test((e.innerText || '').trim()) && (e.innerText || '').length < 80);
+      if (!m.length) return null;
+      const el = m[m.length - 1];
+      el.scrollIntoView({ block: 'center' });
+      const r = el.getBoundingClientRect();
+      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+    })();
+  `);
+}
+
+async function attachFile(win, file) {
+  dbgLog('---- attachFile shuru: ' + file);
+  const dbg = win.webContents.debugger;
+  let mine = false;
+  try { if (!dbg.isAttached()) { dbg.attach('1.3'); mine = true; } } catch (e) { dbgLog('debugger attach fail: ' + e.message); }
+  let ok = false;
+
+  const tryStep = async (name, fn) => {
+    if (ok) return;
+    try { await fn(); } catch (e) { dbgLog(name + ' error: ' + e.message); }
+    await sleep(2500);
+    ok = await hasPreview(win);
+    dbgLog(name + ' -> ' + (ok ? 'PHOTO LAG GAYI' : 'nahi lagi'));
+  };
+
+  try {
+    // 1) dialog ke andar wale file input mein
+    await tryStep('1 file-input', async () => {
+      await dbg.sendCommand('DOM.enable');
+      const doc = await dbg.sendCommand('DOM.getDocument', { depth: -1, pierce: true });
+      const q = await dbg.sendCommand('DOM.querySelectorAll', { nodeId: doc.root.nodeId, selector: 'div[role="dialog"] input[type="file"]' });
+      const ids = (q.nodeIds || []).filter(Boolean);
+      dbgLog('dialog ke andar file inputs: ' + ids.length);
+      if (ids.length) await dbg.sendCommand('DOM.setFileInputFiles', { files: [file], nodeId: ids[ids.length - 1] });
+    });
+
+    // 2) "Add photos or videos" dabao aur file chooser intercept karo
+    await tryStep('2 file-chooser', async () => {
+      let handler = null;
+      try {
+        await dbg.sendCommand('Page.enable');
+        await dbg.sendCommand('Page.setInterceptFileChooserDialog', { enabled: true });
+        let handled = false;
+        handler = async (ev, method, params) => {
+          if (method === 'Page.fileChooserOpened' && !handled) {
+            handled = true;
+            dbgLog('file chooser khula, photo daal raha hoon');
+            try { await dbg.sendCommand('DOM.setFileInputFiles', { files: [file], backendNodeId: params.backendNodeId }); } catch (e) { dbgLog('chooser set error: ' + e.message); }
+          }
+        };
+        dbg.on('message', handler);
+        const pos = await dropzonePos(win);
+        if (!pos) { dbgLog('Add photos wala hissa nahi mila'); return; }
+        await realClick(win, pos.x, pos.y);
+        for (let i = 0; i < 6 && !handled; i++) await sleep(500);
+        if (!handled) dbgLog('click ke baad file chooser nahi khula');
+      } finally {
+        try { if (handler) dbg.removeListener('message', handler); } catch (e) {}
+        try { await dbg.sendCommand('Page.setInterceptFileChooserDialog', { enabled: false }); } catch (e) {}
+      }
+    });
+
+    // 3) drag and drop
+    await tryStep('3 drag-drop', async () => {
+      const pos = await dropzonePos(win);
+      if (!pos) { dbgLog('dropzone nahi mila'); return; }
+      const data = { items: [], files: [file], dragOperationsMask: 1 };
+      await dbg.sendCommand('Input.dispatchDragEvent', { type: 'dragEnter', x: pos.x, y: pos.y, data });
+      await sleep(150);
+      await dbg.sendCommand('Input.dispatchDragEvent', { type: 'dragOver', x: pos.x, y: pos.y, data });
+      await sleep(150);
+      await dbg.sendCommand('Input.dispatchDragEvent', { type: 'drop', x: pos.x, y: pos.y, data });
+    });
+
+    // 4) clipboard se paste (sirf photo ke liye)
+    await tryStep('4 paste', async () => {
+      const img = nativeImage.createFromPath(file);
+      if (img.isEmpty()) { dbgLog('paste: file photo nahi hai (video?)'); return; }
+      clipboard.writeImage(img);
+      await js(win, `(function () {
+        const t = document.querySelector('div[role="dialog"] div[contenteditable="true"][role="textbox"]') || document.querySelector('div[contenteditable="true"][role="textbox"]');
+        if (t) t.focus();
+        return !!t;
+      })();`);
+      await sleep(300);
+      win.webContents.paste();
+    });
+  } finally {
+    try { if (mine) dbg.detach(); } catch (e) {}
+  }
+  await sleep(1200);
+  await shot(win, 'fb-3b-attached');
+  dbgLog('attachFile nateeja: ' + (ok ? 'OK' : 'FAIL'));
+  return ok;
+}
+async function postButton(win) {
+  return js(win, `
+    (function () {
+      const b = document.querySelector('div[aria-label="Post"][role="button"]');
+      if (!b) return 'nobutton';
+      if (b.getAttribute('aria-disabled') === 'true') return 'disabled';
+      const r = b.getBoundingClientRect();
+      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+    })();
+  `);
+}
+
+async function dialogOpen(win) {
+  return js(win, `!!document.querySelector('div[contenteditable="true"][role="textbox"]')`).catch(() => true);
+}
+// Facebook ne links wali posts ki mahine ki limit laga di hai (Meta One), isliye Facebook ke liye links hata do
+function stripLinks(t) {
+  const has = /https?:\/\/\S+|www\.\S+/i;
+  const all = /https?:\/\/\S+|www\.\S+/gi;
+  return String(t || '').split('\n').map((line) => {
+    if (!has.test(line)) return line;
+    const rest = line.replace(all, '').trim();
+    return rest === '' || /^[^:\uFF1A]{0,30}[:\uFF1A]$/.test(rest) ? null : rest;
+  }).filter((l) => l !== null).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+const SCOPED = `!!document.querySelector('div[role="dialog"] div[contenteditable="true"][role="textbox"]')`;
+
+async function postToFacebook(text, file) {
+  const win = new BrowserWindow({
+    width: 1400, height: 950, show: true,
+    webPreferences: { partition: 'persist:facebook' },
+  });
+  win.webContents.setUserAgent(
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + process.versions.chrome.split('.')[0] + '.0.0.0 Safari/537.36'
+  );
+  try {
+    await win.loadURL('https://www.facebook.com/');
+    await sleep(2800);
+
+    const findBox = `
+      (function () {
+        const all = [...document.querySelectorAll('div[role="button"], span')];
+        const m = all.filter(e => /on your mind/i.test((e.innerText || '').trim()) && (e.innerText || '').length < 100);
+        if (!m.length) return null;
+        const el = m[m.length - 1];
+        el.scrollIntoView({ block: 'center' });
+        const r = el.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `;
+    const pos = await js(win, findBox);
+    await sleep(400);
+    await shot(win, 'fb-1-home');
+    if (!pos) return { ok: false, message: 'Facebook: post box nahi mila (fb-1-home.png dekhein)' };
+
+    const pos2 = await js(win, findBox);
+    await realClick(win, pos2.x, pos2.y);
+
+    let dlg = false;
+    for (let i = 0; i < 12; i++) {
+      await sleep(400);
+      dlg = await dialogOpen(win);
+      if (dlg) break;
+    }
+    await shot(win, 'fb-2-dialog');
+    if (!dlg) return { ok: false, message: 'Facebook: click ke baad bhi dialog nahi khuli (fb-2-dialog.png dekhein)' };
+
+    await js(win, `document.querySelector('div[contenteditable="true"][role="textbox"]').focus(); true;`);
+    await sleep(500);
+    // aakhri hashtag ke baad space, taake hashtag suggestion band ho jaye
+   await win.webContents.insertText(stripLinks(text) + ' ');
+    await sleep(700);
+    if (file) {
+      const attachedOk = await attachFile(win, file);
+      if (!attachedOk) return { ok: false, message: 'Facebook: photo attach nahi hui, isliye post nahi ki (fb-3b-attached.png dekhein)' };
+    }
+    await sleep(1050);
+    await shot(win, 'fb-3-typed');
+
+    const btn = await postButton(win);
+    if (typeof btn === 'string') return { ok: false, message: 'Facebook: Post button ' + btn + ' (fb-3-typed.png dekhein)' };
+
+    // asli post wale dialog ko pehchano; mil jaye to sirf usi ko dekhte rahenge
+    const useScoped = await js(win, SCOPED).catch(() => false);
+    const isOpen = () => (useScoped ? js(win, SCOPED).catch(() => true) : dialogOpen(win));
+    dbgLog('Post dabaya (scoped dialog check: ' + useScoped + ')');
+    await realClick(win, btn.x, btn.y);
+
+    // 4 minute tak intezar: dialog band hone ka (upload mein waqt lag sakta hai), aur beech mein "Not now" jaise popup
+    const started = Date.now();
+    const MAX_WAIT = 4 * 60 * 1000;
+    let closed = false, retried = false, n = 0, lastLog = 0, shotWait = false;
+    while (Date.now() - started < MAX_WAIT) {
+      await sleep(750);
+      n++;
+      
+      const linkLimit = await js(win, `/posts with links this month|Get more from links/i.test(document.body.innerText)`).catch(() => false);
+      if (linkLimit) {
+        await shot(win, 'fb-4-linklimit');
+        dbgLog('Meta One link limit popup aaya');
+        return { ok: false, message: 'Facebook: is mahine links wali posts ki limit poori ho gayi (Meta One). Post se links hata kar dobara karein' };
+      }
+
+      const notNow = await js(win, `
+        (function () {
+          const b = [...document.querySelectorAll('div[role="button"], button')]
+            .find(e => /^not now$/i.test((e.innerText || '').trim()));
+          if (!b) return null;
+          const r = b.getBoundingClientRect();
+          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        })();
+      `);
+      if (notNow) {
+        await realClick(win, notNow.x, notNow.y);
+        await sleep(700);
+        const again = await postButton(win);
+        if (typeof again === 'object') await realClick(win, again.x, again.y);
+        continue;
+      }
+
+      if (!(await isOpen())) { closed = true; break; }
+
+      // 6 second baad bhi Post button waisa hi enabled hai (post shuru nahi hui) to sirf ek dafa dobara dabao
+      if (!retried && n === 8) {
+        const again = await postButton(win);
+        if (typeof again === 'object') { await realClick(win, again.x, again.y); retried = true; dbgLog('Post dobara dabaya'); }
+      }
+
+      if (Date.now() - lastLog > 10000) {
+        lastLog = Date.now();
+        const secs = Math.round((Date.now() - started) / 1000);
+        const snip = await js(win, `(function () { const d = document.querySelector('div[role="dialog"]'); return d ? (d.innerText || '').replace(/\\s+/g, ' ').slice(0, 150) : '(dialog nahi)'; })();`).catch(() => '?');
+        dbgLog('post ke baad ' + secs + 's: ' + snip);
+        if (secs >= 15 && !shotWait) { shotWait = true; await shot(win, 'fb-4-wait'); }
+      }
+    }
+    await sleep(1500);
+    await shot(win, 'fb-4-after');
+
+    if (!closed) return { ok: false, message: 'Facebook: 4 minute tak dialog band nahi hui. Post shayad ho gayi ho, profile check karein (fb-4-after.png aur fb-debug.txt dekhein)' };
+    dbgLog('dialog band hui, post ho gayi');
+    return { ok: true, message: 'Facebook: post ho gayi, dialog band hui' };
+  } finally {
+    await sleep(1750);
+    win.close();
+  }
+}
+
+module.exports = { postToFacebook };
+
+===== D:\projects\social-poster\electron\facebook_backup.cjs =====
+
+const { BrowserWindow } = require('electron');
+const fs = require('fs');
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const DIR = 'C:\\SocialPosterData';
+
+async function shot(win, name) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const img = await win.webContents.capturePage();
+    fs.writeFileSync(DIR + '\\' + name + '.png', img.toPNG());
+  } catch (e) {}
+}
+
+async function attachFile(win, file) {
+  const pos = await js(win, `(function(){const b=document.querySelector("div[role=dialog] div[aria-label*=Photo]");if(!b)return null;const r=b.getBoundingClientRect();return {x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)};})();`);
+  if (pos) { await realClick(win, pos.x, pos.y); await sleep(875); }
+  const dbg = win.webContents.debugger;
+  try { dbg.attach("1.3"); } catch (e) {}
+  try {
+    const doc = await dbg.sendCommand("DOM.getDocument", { depth: -1 });
+    let q = await dbg.sendCommand("DOM.querySelector", { nodeId: doc.root.nodeId, selector: `input[type="file"]` });
+    if (!q.nodeId) q = await dbg.sendCommand("DOM.querySelector", { nodeId: doc.root.nodeId, selector: `input[type="file"]` });
+    if (q.nodeId) await dbg.sendCommand("DOM.setFileInputFiles", { files: [file], nodeId: q.nodeId });
+  } catch (e) {}
+  try { dbg.detach(); } catch (e) {}
+  await sleep(2800);
+  await shot(win, "fb-3b-attached");
+}
+function js(win, code) {
+  return win.webContents.executeJavaScript(code);
+}
+
+async function realClick(win, x, y) {
+  const wc = win.webContents;
+  wc.sendInputEvent({ type: 'mouseMove', x, y });
+  await sleep(200);
+  wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+  wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+}
+
+async function postToFacebook(text, file) {
+  const win = new BrowserWindow({
+    width: 1400, height: 950, show: true,
+    webPreferences: { partition: 'persist:facebook' },
+  });
+  win.webContents.setUserAgent(
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + process.versions.chrome.split('.')[0] + '.0.0.0 Safari/537.36'
+  );
+  try {
+    await win.loadURL('https://www.facebook.com/');
+    await sleep(2800);
+
+    // box ki asli position (sab se chhota element jis mein "on your mind" likha ho)
+    const pos = await js(win, `
+      (function () {
+        const all = [...document.querySelectorAll('div[role="button"], span')];
+        const m = all.filter(e => /on your mind/i.test((e.innerText || '').trim()) && (e.innerText || '').length < 100);
+        if (!m.length) return null;
+        const el = m[m.length - 1];
+        el.scrollIntoView({ block: 'center' });
+        const r = el.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    await sleep(400);
+    await shot(win, 'fb-1-home');
+    if (!pos) return { ok: false, message: 'Facebook: post box nahi mila (fb-1-home.png dekhein)' };
+
+    const pos2 = await js(win, `
+      (function () {
+        const all = [...document.querySelectorAll('div[role="button"], span')];
+        const m = all.filter(e => /on your mind/i.test((e.innerText || '').trim()) && (e.innerText || '').length < 100);
+        const el = m[m.length - 1];
+        const r = el.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    await realClick(win, pos2.x, pos2.y);
+
+    // dialog ka intezar
+    let dlg = false;
+    for (let i = 0; i < 12; i++) {
+      await sleep(400);
+      dlg = await js(win, `!!document.querySelector('div[contenteditable="true"][role="textbox"]')`).catch(() => false);
+      if (dlg) break;
+    }
+    await shot(win, 'fb-2-dialog');
+    if (!dlg) return { ok: false, message: 'Facebook: click ke baad bhi dialog nahi khuli (fb-2-dialog.png dekhein)' };
+
+    await js(win, `document.querySelector('div[contenteditable="true"][role="textbox"]').focus(); true;`);
+    await sleep(500);
+    await win.webContents.insertText(text || '');
+    if (file) await attachFile(win, file);
+    await sleep(1050);
+    await shot(win, 'fb-3-typed');
+
+    const btnPos = await js(win, `
+      (function () {
+        const b = document.querySelector('div[aria-label="Post"][role="button"]');
+        if (!b) return 'nobutton';
+        if (b.getAttribute('aria-disabled') === 'true') return 'disabled';
+        const r = b.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    if (typeof btnPos === 'string') return { ok: false, message: 'Facebook: Post button ' + btnPos + ' (fb-3-typed.png dekhein)' };
+    await realClick(win, btnPos.x, btnPos.y);
+    await sleep(1050);
+    // "Add WhatsApp button" jaisa popup aaye to "Not now" dabao, phir Post dobara
+    const notNow = await js(win, `
+      (function () {
+        const b = [...document.querySelectorAll('div[role="button"], button')]
+          .find(e => /^not now$/i.test((e.innerText || '').trim()));
+        if (!b) return null;
+        const r = b.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    if (notNow) {
+      await realClick(win, notNow.x, notNow.y);
+      await sleep(700);
+      const again = await js(win, `
+        (function () {
+          const b = document.querySelector('div[aria-label="Post"][role="button"]');
+          if (!b || b.getAttribute('aria-disabled') === 'true') return null;
+          const r = b.getBoundingClientRect();
+          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        })();
+      `);
+      if (again) await realClick(win, again.x, again.y);
+    }
+    await sleep(2800);
+    await shot(win, 'fb-4-after');
+
+    const still = await js(win, `!!document.querySelector('div[contenteditable="true"][role="textbox"]')`).catch(() => true);
+    if (still) return { ok: false, message: 'Facebook: Post dabaya lekin dialog band nahi hui (fb-4-after.png dekhein)' };
+    return { ok: true, message: 'Facebook: dialog band hui, profile pe check karein' };
+  } finally {
+    await sleep(1750);
+    win.close();
+  }
+}
+
+module.exports = { postToFacebook };
+
+
+
+
+
+
+===== D:\projects\social-poster\electron\facebook_backup2.cjs =====
+
+const { BrowserWindow } = require('electron');
+const fs = require('fs');
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const DIR = 'C:\\SocialPosterData';
+
+async function shot(win, name) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const img = await win.webContents.capturePage();
+    fs.writeFileSync(DIR + '\\' + name + '.png', img.toPNG());
+  } catch (e) {}
+}
+
+function js(win, code) {
+  return win.webContents.executeJavaScript(code);
+}
+
+async function realClick(win, x, y) {
+  const wc = win.webContents;
+  wc.sendInputEvent({ type: 'mouseMove', x, y });
+  await sleep(250);
+  wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+  await sleep(80);
+  wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+}
+
+async function attachFile(win, file) {
+  const pos = await js(win, `(function(){const b=document.querySelector("div[role=dialog] div[aria-label*=Photo]")||document.querySelector("div[aria-label*=Photo]");if(!b)return null;const r=b.getBoundingClientRect();return {x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)};})();`);
+  if (pos) { await realClick(win, pos.x, pos.y); await sleep(875); }
+  const dbg = win.webContents.debugger;
+  try { dbg.attach("1.3"); } catch (e) {}
+  try {
+    const doc = await dbg.sendCommand("DOM.getDocument", { depth: -1 });
+    let q = await dbg.sendCommand("DOM.querySelectorAll", { nodeId: doc.root.nodeId, selector: `input[type="file"]` });
+    if (!q.nodeIds || !q.nodeIds.length) {
+      await sleep(800);
+      q = await dbg.sendCommand("DOM.querySelectorAll", { nodeId: doc.root.nodeId, selector: `input[type="file"]` });
+    }
+    if (q.nodeIds && q.nodeIds.length) {
+      await dbg.sendCommand("DOM.setFileInputFiles", { files: [file], nodeId: q.nodeIds[q.nodeIds.length - 1] });
+    }
+  } catch (e) {}
+  try { dbg.detach(); } catch (e) {}
+  await sleep(2800);
+  await shot(win, "fb-3b-attached");
+}
+
+async function postButton(win) {
+  return js(win, `
+    (function () {
+      const b = document.querySelector('div[aria-label="Post"][role="button"]');
+      if (!b) return 'nobutton';
+      if (b.getAttribute('aria-disabled') === 'true') return 'disabled';
+      const r = b.getBoundingClientRect();
+      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+    })();
+  `);
+}
+
+async function dialogOpen(win) {
+  return js(win, `!!document.querySelector('div[contenteditable="true"][role="textbox"]')`).catch(() => true);
+}
+
+async function postToFacebook(text, file) {
+  const win = new BrowserWindow({
+    width: 1400, height: 950, show: true,
+    webPreferences: { partition: 'persist:facebook' },
+  });
+  win.webContents.setUserAgent(
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + process.versions.chrome.split('.')[0] + '.0.0.0 Safari/537.36'
+  );
+  try {
+    await win.loadURL('https://www.facebook.com/');
+    await sleep(2800);
+
+    const findBox = `
+      (function () {
+        const all = [...document.querySelectorAll('div[role="button"], span')];
+        const m = all.filter(e => /on your mind/i.test((e.innerText || '').trim()) && (e.innerText || '').length < 100);
+        if (!m.length) return null;
+        const el = m[m.length - 1];
+        el.scrollIntoView({ block: 'center' });
+        const r = el.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `;
+    const pos = await js(win, findBox);
+    await sleep(400);
+    await shot(win, 'fb-1-home');
+    if (!pos) return { ok: false, message: 'Facebook: post box nahi mila (fb-1-home.png dekhein)' };
+
+    const pos2 = await js(win, findBox);
+    await realClick(win, pos2.x, pos2.y);
+
+    let dlg = false;
+    for (let i = 0; i < 12; i++) {
+      await sleep(400);
+      dlg = await dialogOpen(win);
+      if (dlg) break;
+    }
+    await shot(win, 'fb-2-dialog');
+    if (!dlg) return { ok: false, message: 'Facebook: click ke baad bhi dialog nahi khuli (fb-2-dialog.png dekhein)' };
+
+    await js(win, `document.querySelector('div[contenteditable="true"][role="textbox"]').focus(); true;`);
+    await sleep(500);
+    // aakhri hashtag ke baad space, taake hashtag suggestion band ho jaye
+    await win.webContents.insertText((text || '') + ' ');
+    await sleep(700);
+    if (file) await attachFile(win, file);
+    await sleep(1050);
+    await shot(win, 'fb-3-typed');
+
+    const btn = await postButton(win);
+    if (typeof btn === 'string') return { ok: false, message: 'Facebook: Post button ' + btn + ' (fb-3-typed.png dekhein)' };
+    await realClick(win, btn.x, btn.y);
+
+    // 30 second tak intezar: dialog band hone ka, aur beech mein "Not now" jaise popup
+    let closed = false, retried = false;
+    for (let i = 0; i < 40; i++) {
+      await sleep(750);
+
+      const notNow = await js(win, `
+        (function () {
+          const b = [...document.querySelectorAll('div[role="button"], button')]
+            .find(e => /^not now$/i.test((e.innerText || '').trim()));
+          if (!b) return null;
+          const r = b.getBoundingClientRect();
+          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        })();
+      `);
+      if (notNow) {
+        await realClick(win, notNow.x, notNow.y);
+        await sleep(700);
+        const again = await postButton(win);
+        if (typeof again === 'object') await realClick(win, again.x, again.y);
+        continue;
+      }
+
+      if (!(await dialogOpen(win))) { closed = true; break; }
+
+      // 6 second baad bhi Post button waisa hi enabled hai (post shuru nahi hui) to sirf ek dafa dobara dabao
+      if (!retried && i === 8) {
+        const again = await postButton(win);
+        if (typeof again === 'object') { await realClick(win, again.x, again.y); retried = true; }
+      }
+    }
+    await sleep(1500);
+    await shot(win, 'fb-4-after');
+
+    if (!closed) return { ok: false, message: 'Facebook: 30 second tak dialog band nahi hui. Post shayad ho gayi ho, profile check karein (fb-4-after.png dekhein)' };
+    return { ok: true, message: 'Facebook: post ho gayi, dialog band hui' };
+  } finally {
+    await sleep(1750);
+    win.close();
+  }
+}
+
+module.exports = { postToFacebook };
+
+===== D:\projects\social-poster\electron\facebook_backup3.cjs =====
+
+const { BrowserWindow } = require('electron');
+const fs = require('fs');
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const DIR = 'C:\\SocialPosterData';
+
+async function shot(win, name) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const img = await win.webContents.capturePage();
+    fs.writeFileSync(DIR + '\\' + name + '.png', img.toPNG());
+  } catch (e) {}
+}
+
+function js(win, code) {
+  return win.webContents.executeJavaScript(code);
+}
+
+async function realClick(win, x, y) {
+  const wc = win.webContents;
+  wc.sendInputEvent({ type: 'mouseMove', x, y });
+  await sleep(250);
+  wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+  await sleep(80);
+  wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+}
+
+async function hasPreview(win) {
+  return js(win, `
+    (function () {
+      const d = document.querySelector('div[role="dialog"]') || document;
+      if (d.querySelector('img[src^="blob:"], video[src^="blob:"]')) return true;
+      return !/add photos or videos/i.test(d.innerText || '');
+    })();
+  `).catch(() => false);
+}
+
+async function attachFile(win, file) {
+  const dbg = win.webContents.debugger;
+  let mine = false;
+  try { if (!dbg.isAttached()) { dbg.attach('1.3'); mine = true; } } catch (e) {}
+  let ok = false;
+  try {
+    // 1) maujooda file input mein photo daalo
+    try {
+      await dbg.sendCommand('DOM.enable');
+      const doc = await dbg.sendCommand('DOM.getDocument', { depth: -1, pierce: true });
+      const q = await dbg.sendCommand('DOM.querySelectorAll', { nodeId: doc.root.nodeId, selector: 'input[type="file"]' });
+      const ids = (q.nodeIds || []).filter(Boolean);
+      if (ids.length) await dbg.sendCommand('DOM.setFileInputFiles', { files: [file], nodeId: ids[ids.length - 1] });
+    } catch (e) {}
+    await sleep(2500);
+    ok = await hasPreview(win);
+
+    // 2) na lage to "Add photos or videos" dabao aur file chooser intercept karo
+    if (!ok) {
+      let handler = null;
+      try {
+        await dbg.sendCommand('Page.enable');
+        await dbg.sendCommand('Page.setInterceptFileChooserDialog', { enabled: true });
+        let handled = false;
+        handler = async (ev, method, params) => {
+          if (method === 'Page.fileChooserOpened' && !handled) {
+            handled = true;
+            try { await dbg.sendCommand('DOM.setFileInputFiles', { files: [file], backendNodeId: params.backendNodeId }); } catch (e) {}
+          }
+        };
+        dbg.on('message', handler);
+        const pos = await js(win, `
+          (function () {
+            const d = document.querySelector('div[role="dialog"]') || document;
+            const m = [...d.querySelectorAll('div[role="button"], div, span')]
+              .filter(e => /add photos or videos/i.test((e.innerText || '').trim()) && (e.innerText || '').length < 80);
+            if (!m.length) return null;
+            const el = m[m.length - 1];
+            el.scrollIntoView({ block: 'center' });
+            const r = el.getBoundingClientRect();
+            return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+          })();
+        `);
+        if (pos) await realClick(win, pos.x, pos.y);
+        for (let i = 0; i < 8 && !ok; i++) { await sleep(700); ok = await hasPreview(win); }
+      } catch (e) {}
+      try { if (handler) dbg.removeListener('message', handler); } catch (e) {}
+      try { await dbg.sendCommand('Page.setInterceptFileChooserDialog', { enabled: false }); } catch (e) {}
+    }
+  } finally {
+    try { if (mine) dbg.detach(); } catch (e) {}
+  }
+  await sleep(1200);
+  await shot(win, 'fb-3b-attached');
+  return ok;
+}
+async function postButton(win) {
+  return js(win, `
+    (function () {
+      const b = document.querySelector('div[aria-label="Post"][role="button"]');
+      if (!b) return 'nobutton';
+      if (b.getAttribute('aria-disabled') === 'true') return 'disabled';
+      const r = b.getBoundingClientRect();
+      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+    })();
+  `);
+}
+
+async function dialogOpen(win) {
+  return js(win, `!!document.querySelector('div[contenteditable="true"][role="textbox"]')`).catch(() => true);
+}
+
+async function postToFacebook(text, file) {
+  const win = new BrowserWindow({
+    width: 1400, height: 950, show: true,
+    webPreferences: { partition: 'persist:facebook' },
+  });
+  win.webContents.setUserAgent(
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + process.versions.chrome.split('.')[0] + '.0.0.0 Safari/537.36'
+  );
+  try {
+    await win.loadURL('https://www.facebook.com/');
+    await sleep(2800);
+
+    const findBox = `
+      (function () {
+        const all = [...document.querySelectorAll('div[role="button"], span')];
+        const m = all.filter(e => /on your mind/i.test((e.innerText || '').trim()) && (e.innerText || '').length < 100);
+        if (!m.length) return null;
+        const el = m[m.length - 1];
+        el.scrollIntoView({ block: 'center' });
+        const r = el.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `;
+    const pos = await js(win, findBox);
+    await sleep(400);
+    await shot(win, 'fb-1-home');
+    if (!pos) return { ok: false, message: 'Facebook: post box nahi mila (fb-1-home.png dekhein)' };
+
+    const pos2 = await js(win, findBox);
+    await realClick(win, pos2.x, pos2.y);
+
+    let dlg = false;
+    for (let i = 0; i < 12; i++) {
+      await sleep(400);
+      dlg = await dialogOpen(win);
+      if (dlg) break;
+    }
+    await shot(win, 'fb-2-dialog');
+    if (!dlg) return { ok: false, message: 'Facebook: click ke baad bhi dialog nahi khuli (fb-2-dialog.png dekhein)' };
+
+    await js(win, `document.querySelector('div[contenteditable="true"][role="textbox"]').focus(); true;`);
+    await sleep(500);
+    // aakhri hashtag ke baad space, taake hashtag suggestion band ho jaye
+    await win.webContents.insertText((text || '') + ' ');
+    await sleep(700);
+    if (file) {
+      const attachedOk = await attachFile(win, file);
+      if (!attachedOk) return { ok: false, message: 'Facebook: photo attach nahi hui, isliye post nahi ki (fb-3b-attached.png dekhein)' };
+    }
+    await sleep(1050);
+    await shot(win, 'fb-3-typed');
+
+    const btn = await postButton(win);
+    if (typeof btn === 'string') return { ok: false, message: 'Facebook: Post button ' + btn + ' (fb-3-typed.png dekhein)' };
+    await realClick(win, btn.x, btn.y);
+
+    // 30 second tak intezar: dialog band hone ka, aur beech mein "Not now" jaise popup
+    let closed = false, retried = false;
+    for (let i = 0; i < 40; i++) {
+      await sleep(750);
+
+      const notNow = await js(win, `
+        (function () {
+          const b = [...document.querySelectorAll('div[role="button"], button')]
+            .find(e => /^not now$/i.test((e.innerText || '').trim()));
+          if (!b) return null;
+          const r = b.getBoundingClientRect();
+          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        })();
+      `);
+      if (notNow) {
+        await realClick(win, notNow.x, notNow.y);
+        await sleep(700);
+        const again = await postButton(win);
+        if (typeof again === 'object') await realClick(win, again.x, again.y);
+        continue;
+      }
+
+      if (!(await dialogOpen(win))) { closed = true; break; }
+
+      // 6 second baad bhi Post button waisa hi enabled hai (post shuru nahi hui) to sirf ek dafa dobara dabao
+      if (!retried && i === 8) {
+        const again = await postButton(win);
+        if (typeof again === 'object') { await realClick(win, again.x, again.y); retried = true; }
+      }
+    }
+    await sleep(1500);
+    await shot(win, 'fb-4-after');
+
+    if (!closed) return { ok: false, message: 'Facebook: 30 second tak dialog band nahi hui. Post shayad ho gayi ho, profile check karein (fb-4-after.png dekhein)' };
+    return { ok: true, message: 'Facebook: post ho gayi, dialog band hui' };
+  } finally {
+    await sleep(1750);
+    win.close();
+  }
+}
+
+module.exports = { postToFacebook };
+
+===== D:\projects\social-poster\electron\instagram.cjs =====
+
+const { clipboard } = require('electron');
+const { sleep, makeWindow, waitFor, clickText, setFile, ensureLogin } = require('./util.cjs');
+
+const BOX = 'div[aria-label*="aption"][contenteditable="true"], div[role="dialog"] div[contenteditable="true"][role="textbox"], div[role="dialog"] div[contenteditable="true"]';
+const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+
+const log = (line) => {
+  try {
+    const fs = require('fs');
+    fs.mkdirSync('C:\\SocialPosterData', { recursive: true });
+    fs.appendFileSync('C:\\SocialPosterData\\ig-log.txt', new Date().toISOString() + ' ' + line + '\n', 'utf8');
+  } catch (e) { /* ignore */ }
+};
+
+async function postToInstagram(text, file) {
+  log('len=' + String(text || '').length + ' text=' + String(text || '').slice(0, 40).replace(/\n/g, ' '));
+  if (!file) return { ok: false, message: 'Instagram: pehle photo/video choose karein' };
+  const win = makeWindow('instagram');
+  const run = (code) => win.webContents.executeJavaScript(code).catch(() => null);
+  try {
+    await ensureLogin(win, 'https://www.instagram.com/');
+
+    const created = await run(`
+      (function () {
+        const svg = document.querySelector('svg[aria-label="New post"]');
+        if (!svg) return false;
+        (svg.closest('a, div[role="button"], div[role="link"]') || svg).click();
+        return true;
+      })();
+    `);
+    if (!created) return { ok: false, message: 'Instagram: Create (New post) button nahi mila' };
+    await sleep(1500);
+    await clickText(win, '^post$');
+    await sleep(1500);
+
+    if (!(await waitFor(win, `!!document.querySelector('input[type="file"]')`, 15000)))
+      return { ok: false, message: 'Instagram: file wala box nahi mila' };
+    const attached =
+      (await setFile(win, 'div[role="dialog"] input[type="file"]', file)) ||
+      (await setFile(win, 'input[type="file"]', file));
+    if (!attached) return { ok: false, message: 'Instagram: file attach nahi hui' };
+    await sleep(2500);
+    await clickText(win, '^ok$'); // "video ab reel ban jati hai" popup
+
+    if (!(await waitFor(win, `[...document.querySelectorAll('div[role="button"]')].some(e=>/^next$/i.test((e.innerText||'').trim()))`, 30000)))
+      return { ok: false, message: 'Instagram: Next button not found' };
+
+    // Next dabate jao jab tak caption box na aa jaye
+    let haveBox = false;
+    for (let i = 0; i < 40 && !haveBox; i++) {
+      haveBox = !!(await run(`!!document.querySelector(${JSON.stringify(BOX)})`));
+      if (haveBox) break;
+      await clickText(win, '^next$');
+      await sleep(900);
+    }
+    if (!haveBox) return { ok: false, message: 'Instagram: caption box not found' };
+    await sleep(1200);
+
+    if (text) {
+      const full = norm(text);
+      const want = full.slice(0, 12);
+      const boxText = async () => norm(await run(`(function(){ const b = document.querySelector(${JSON.stringify(BOX)}); return b ? (b.innerText || '') : ''; })()`));
+      const focusBox = () => run(`(function(){ const b = document.querySelector(${JSON.stringify(BOX)}); if(!b) return false; b.scrollIntoView({block:'center'}); b.focus(); b.click(); document.execCommand('selectAll'); document.execCommand('delete'); return true; })()`);
+      let typed = false;
+      for (let attempt = 0; attempt < 4 && !typed; attempt++) {
+        await focusBox();
+        await sleep(500);
+        try {
+          win.focus();
+          win.webContents.focus();
+          if (attempt % 2 === 0) {
+            // Paste: Instagram ka editor isay asli paste maanta hai, isliye caption share ke waqt bhi rehta hai
+            clipboard.writeText(text);
+            win.webContents.paste();
+          } else {
+            await win.webContents.insertText(text);
+          }
+        } catch (e) { /* ignore */ }
+        await sleep(1200);
+        const now = await boxText();
+        typed = now.includes(want) && now.length >= full.length * 0.9;
+        log('caption attempt ' + (attempt + 1) + ' box_len=' + now.length + ' need=' + full.length + ' ok=' + typed);
+        if (!typed) await sleep(1000);
+      }
+      if (!typed) return { ok: false, message: 'Instagram: the caption could not be entered, so the post was not shared' };
+      // nudge the editor so its internal state matches what is on screen
+      try {
+        const wc = win.webContents;
+        wc.sendInputEvent({ type: 'keyDown', keyCode: 'End', modifiers: ['control'] });
+        wc.sendInputEvent({ type: 'keyUp', keyCode: 'End', modifiers: ['control'] });
+        await sleep(200);
+        await wc.insertText(' ');
+        await sleep(200);
+        wc.sendInputEvent({ type: 'keyDown', keyCode: 'Backspace' });
+        wc.sendInputEvent({ type: 'keyUp', keyCode: 'Backspace' });
+      } catch (e) { /* ignore */ }
+      await sleep(2500);
+      const finalText = await boxText();
+      log('caption final box_len=' + finalText.length);
+      if (!finalText.includes(want)) return { ok: false, message: 'Instagram: the caption disappeared before sharing, so the post was not shared' };
+    }
+
+    if (!(await clickText(win, '^share$')))
+      return { ok: false, message: 'Instagram: Share button not found' };
+
+    const done = await waitFor(win, `/has been shared|post shared|reel shared/i.test(document.body.innerText)`, 120000);
+    return done
+      ? { ok: true, message: 'Instagram: posted (with caption)' }
+      : { ok: false, message: 'Instagram: Share was clicked but no confirmation appeared. Please check manually' };
+  } finally {
+    await sleep(1500);
+    try { if (!win.isDestroyed()) win.close(); } catch (e) { /* ignore */ }
+  }
+}
+
+module.exports = { postToInstagram };
+
+===== D:\projects\social-poster\electron\instagram_backup.cjs =====
+
+const { sleep, makeWindow, waitFor, clickText, setFile, ensureLogin } = require('./util.cjs');
+
+async function postToInstagram(text, file) {
+  if (!file) return { ok: false, message: 'Instagram: pehle photo/video choose karein' };
+  const win = makeWindow('instagram');
+  try {
+    await ensureLogin(win, 'https://www.instagram.com/');
+
+    const created = await win.webContents.executeJavaScript(`
+      (function () {
+        const svg = document.querySelector('svg[aria-label="New post"]');
+        if (!svg) return false;
+        (svg.closest('a, div[role="button"], div[role="link"]') || svg).click();
+        return true;
+      })();
+    `);
+    if (!created) return { ok: false, message: 'Instagram: Create (New post) button nahi mila' };
+    await sleep(700);
+    await clickText(win, '^post$');
+    await sleep(700);
+
+    if (!(await waitFor(win, `!!document.querySelector('input[type="file"]')`, 15000)))
+      return { ok: false, message: 'Instagram: file wala box nahi mila' };
+    const attached =
+      (await setFile(win, 'div[role="dialog"] input[type="file"]', file)) ||
+      (await setFile(win, 'input[type="file"]', file));
+    if (!attached) return { ok: false, message: 'Instagram: file attach nahi hui' };
+    await sleep(2100);
+    await clickText(win, '^ok$'); // "video ab reel ban jati hai" popup
+
+    if (!(await waitFor(win, `[...document.querySelectorAll('div[role="button"]')].some(e=>/^next$/i.test((e.innerText||'').trim()))`, 30000)))
+      return { ok: false, message: 'Instagram: Next button nahi mila' };
+    await clickText(win, '^next$');
+    await sleep(1050);
+    await clickText(win, '^next$');
+    await sleep(1050);
+
+    const captionOk = await waitFor(win, `
+      (function () {
+        const box = document.querySelector('div[aria-label*="aption"], div[role="dialog"] div[contenteditable="true"]');
+        if (!box) return false;
+        box.focus();
+        document.execCommand('insertText', false, ${JSON.stringify(text || '')});
+        return true;
+      })();
+    `, 20000);
+    if (!captionOk) return { ok: false, message: 'Instagram: caption box nahi mila' };
+    await sleep(700);
+
+    if (!(await clickText(win, '^share$')))
+      return { ok: false, message: 'Instagram: Share button nahi mila' };
+
+    const done = await waitFor(win, `/has been shared|post shared|reel shared/i.test(document.body.innerText)`, 120000);
+    return done
+      ? { ok: true, message: 'Instagram: post ho gayi' }
+      : { ok: false, message: 'Instagram: Share dabaya lekin confirm nahi aaya, check karein' };
+  } finally {
+    await sleep(700);
+    win.close();
+  }
+}
+
+module.exports = { postToInstagram };
+
+
+===== D:\projects\social-poster\electron\instagram_backup2.cjs =====
+
+const { sleep, makeWindow, waitFor, clickText, setFile, ensureLogin } = require('./util.cjs');
+
+// Crop screen par "Original" chunta hai (na mile to chup chaap aage barh jata hai)
+async function chooseOriginal(win) {
+  const run = (code) => win.webContents.executeJavaScript(code).catch(() => false);
+  const clickOriginal = `
+    (function () {
+      const e = [...document.querySelectorAll('span, div')]
+        .find(x => x.children.length === 0 && /^original$/i.test((x.innerText || '').trim()));
+      if (!e) return false;
+      (e.closest('div[role="button"], button') || e).click();
+      return true;
+    })();
+  `;
+  const openCrop = `
+    (function () {
+      const s = document.querySelector('svg[aria-label="Select crop"]');
+      if (!s) return false;
+      (s.closest('div[role="button"], button') || s).click();
+      return true;
+    })();
+  `;
+  if (await run(clickOriginal)) { await sleep(800); return true; }
+  if (await run(openCrop)) {
+    for (let i = 0; i < 4; i++) {
+      await sleep(500);
+      if (await run(clickOriginal)) { await sleep(800); return true; }
+    }
+  }
+  return false;
+}
+
+async function postToInstagram(text, file) {
+  if (!file) return { ok: false, message: 'Instagram: pehle photo/video choose karein' };
+  const win = makeWindow('instagram');
+  try {
+    await ensureLogin(win, 'https://www.instagram.com/');
+
+    const created = await win.webContents.executeJavaScript(`
+      (function () {
+        const svg = document.querySelector('svg[aria-label="New post"]');
+        if (!svg) return false;
+        (svg.closest('a, div[role="button"], div[role="link"]') || svg).click();
+        return true;
+      })();
+    `);
+    if (!created) return { ok: false, message: 'Instagram: Create (New post) button nahi mila' };
+    await sleep(700);
+    await clickText(win, '^post$');
+    await sleep(700);
+
+    if (!(await waitFor(win, `!!document.querySelector('input[type="file"]')`, 15000)))
+      return { ok: false, message: 'Instagram: file wala box nahi mila' };
+    const attached =
+      (await setFile(win, 'div[role="dialog"] input[type="file"]', file)) ||
+      (await setFile(win, 'input[type="file"]', file));
+    if (!attached) return { ok: false, message: 'Instagram: file attach nahi hui' };
+    await sleep(2100);
+    await clickText(win, '^ok$'); // "video ab reel ban jati hai" popup
+
+    if (!(await waitFor(win, `[...document.querySelectorAll('div[role="button"]')].some(e=>/^next$/i.test((e.innerText||'').trim()))`, 30000)))
+      return { ok: false, message: 'Instagram: Next button nahi mila' };
+
+    await chooseOriginal(win);   // 1:1 ki jagah Original
+
+    await clickText(win, '^next$');
+    await sleep(1050);
+    await clickText(win, '^next$');
+    await sleep(1050);
+
+    const captionOk = await waitFor(win, `
+      (function () {
+        const box = document.querySelector('div[aria-label*="aption"], div[role="dialog"] div[contenteditable="true"]');
+        if (!box) return false;
+        box.focus();
+        document.execCommand('insertText', false, ${JSON.stringify(text || '')});
+        return true;
+      })();
+    `, 20000);
+    if (!captionOk) return { ok: false, message: 'Instagram: caption box nahi mila' };
+    await sleep(700);
+
+    if (!(await clickText(win, '^share$')))
+      return { ok: false, message: 'Instagram: Share button nahi mila' };
+
+    const done = await waitFor(win, `/has been shared|post shared|reel shared/i.test(document.body.innerText)`, 120000);
+    return done
+      ? { ok: true, message: 'Instagram: post ho gayi' }
+      : { ok: false, message: 'Instagram: Share dabaya lekin confirm nahi aaya, check karein' };
+  } finally {
+    await sleep(700);
+    win.close();
+  }
+}
+
+module.exports = { postToInstagram };
+
+===== D:\projects\social-poster\electron\main.cjs =====
+
+const { app, BrowserWindow, ipcMain, dialog, shell, protocol, net } = require('electron');
+const { pathToFileURL } = require('url');
+
+// media:// lets the UI show local photos/videos (thumbnails in History/Preview)
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'media', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, bypassCSP: true } }
+]);
+const MEDIA_OK = /\.(jpe?g|png|gif|webp|bmp|mp4|mov|m4v|webm|avi|mkv)$/i;
+function mediaPathFromUrl(u) {
+  const p = decodeURIComponent(new URL(u).pathname.slice(1));
+  return MEDIA_OK.test(p) ? p : null;
+}
+function registerMedia() {
+  if (typeof protocol.handle === 'function') {
+    protocol.handle('media', (req) => {
+      const p = mediaPathFromUrl(req.url);
+      if (!p) return new Response('Forbidden', { status: 403 });
+      return net.fetch(pathToFileURL(p).toString());
+    });
+  } else {
+    protocol.registerFileProtocol('media', (req, cb) => {
+      const p = mediaPathFromUrl(req.url);
+      cb(p ? { path: p } : { error: -10 });
+    });
+  }
+}
+const path = require('path');
+app.setPath('userData', path.join(app.getPath('appData'), 'social-poster'));
+const { makeWindow } = require('./util.cjs');
+const { postAll } = require('./bots.cjs');
+
+const aITEa = {
+  facebook: 'https://www.facebook.com',
+  instagram: 'https://www.instagram.com',
+  tiktok: 'https://www.tiktok.com/login',
+  whatsapp: 'https://web.whatsapp.com',
+  youtube: 'https://studio.youtube.com',
+};
+const ORDER = ['facebook', 'instagram', 'tiktok', 'whatsapp', 'youtube'];
+let mainWin;
+
+function createWindow() {
+  mainWin = new BrowserWindow({
+    width: 1100,
+    height: 750,
+    webPreferences: { preload: path.join(__dirname, 'preload.cjs') },
+  });
+  if (app.isPackaged) {
+    mainWin.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
+  } else {
+    mainWin.loadURL('http://localhost:5173');
+  }
+}
+
+app.whenReady().then(() => { registerMedia(); createWindow(); });
+app.on('window-all-closed', () => app.quit());
+
+function openLoginElectron(name) {
+  return new Promise((resolve) => {
+    const win = makeWindow(name);
+    win.removeMenu();
+    win.on('closed', resolve);
+    win.loadURL(aITEa[name]).catch((err) => {
+      console.error(`${name} load error:`, err);
+      resolve();
+    });
+  });
+}
+
+ipcMain.handle('open-site', async (e, name) => {
+  if (aITEa[name]) await openLogin(name);
+});
+
+ipcMain.handle('login-all', async () => {
+  for (let i = 0; i < ORDER.length; i++) {
+    const name = ORDER[i];
+    mainWin.webContents.send('login-step', `${i + 1}/${ORDER.length}: ${name} mein login karein, phir ye window band kar dein`);
+    await openLogin(name);
+  }
+  mainWin.webContents.send('login-step', 'aab login ho gaye. lb Post kar sakte hain.');
+  return true;
+});
+
+ipcMain.handle('pick-file', async () => {
+  const r = await dialog.showOpenDialog({
+    properties: ['openFile'],
+    filters: [{ name: 'Photo/Video', extensions: ['jpg', 'jpeg', 'png', 'mp4', 'mov'] }],
+  });
+  return r.canceled ? null : r.filePaths[0];
+});
+
+ipcMain.handle('post-all', async (e, data) => {
+  if (data.dryRun) return { results: data.platforms.map((p) => ({ ok: true, message: p + ': TEaT MODE - asli post nahi hui' })) };
+  const caption = [data.text, data.description].filter(Boolean).join('\n\n');
+  const results = await postAll(caption, data.file, data.platforms);
+  return { results };
+});
+
+// YouTube ka login asli Chrome me (Google app ki window me login block karta hai)
+function openYoutubeChrome() {
+  return new Promise((resolve) => {
+    let chrome;
+    try { chrome = require('./chrome.cjs'); } catch (e) { return resolve(); }
+    if (!chrome.CHROME) return resolve();
+    try { chrome.killProfileChrome(); } catch (e) {}
+    setTimeout(() => {
+      const { spawn } = require('child_process');
+      const child = spawn(chrome.CHROME, [
+        '--user-data-dir=' + chrome.PROFILE,
+        '--disable-background-mode', '--no-first-run', '--no-default-browser-check',
+        '--new-window', aITEa.youtube,
+      ], { stdio: 'ignore' });
+      child.on('exit', () => resolve());
+      child.on('error', () => resolve());
+    }, 1500);
+  });
+}
+
+function openLogin(name) {
+  if (name === 'youtube') return openYoutubeChrome();
+  return openLoginElectron(name);
+}
+
+===== D:\projects\social-poster\electron\preload.cjs =====
+
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('api', {
+  postAll: (data) => ipcRenderer.invoke('post-all', data),
+  openSite: (name) => ipcRenderer.invoke('open-site', name),
+  pickFile: () => ipcRenderer.invoke('pick-file'),
+  loginAll: () => ipcRenderer.invoke('login-all'),
+  onLoginStep: (cb) => ipcRenderer.on('login-step', (_e, msg) => cb(msg)),
+});
+
+===== D:\projects\social-poster\electron\site-preload.cjs =====
+
+try {
+  if (navigator.credentials) {
+    navigator.credentials.get = () => Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));
+    navigator.credentials.create = () => Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));
+  }
+  if (window.PublicKeyCredential) {
+    window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable = () => Promise.resolve(false);
+    window.PublicKeyCredential.isConditionalMediationAvailable = () => Promise.resolve(false);
+  }
+} catch (e) {}
+
+===== D:\projects\social-poster\electron\tiktok.cjs =====
+
+const { sleep, makeWindow, waitFor, clickText, setFile, ensureLogin } = require('./util.cjs');
+
+async function postToTikTok(text, file) {
+  if (!file) return { ok: false, message: 'TikTok: photo ya video choose karein' };
+  const isImage = /\.(png|jpe?g|webp)$/i.test(file);
+  const win = makeWindow('tiktok');
+  win.webContents.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + process.versions.chrome.split('.')[0] + '.0.0.0 Safari/537.36');
+  try {
+    await ensureLogin(win, isImage ? 'https://www.tiktok.com/tiktokstudio/upload?tab=photo' : 'https://www.tiktok.com/tiktokstudio/upload');
+
+    if (!(await waitFor(win, `!!document.querySelector('input[type="file"]')`, 30000)))
+      return { ok: false, message: 'TikTok: upload box nahi mila' };
+    if (!(await setFile(win, 'input[type="file"]', file)))
+      return { ok: false, message: 'TikTok: file attach nahi hui' };
+
+    const BIGBOX = `(function(){ const els=[...document.querySelectorAll('.public-DraftEditor-content, div[contenteditable="true"]')].filter(e=>e.offsetParent!==null); if(!els.length) return null; els.sort((a,b)=>b.getBoundingClientRect().height-a.getBoundingClientRect().height); return els[0]; })()`;
+
+    const found = await waitFor(win, `
+      (function () {
+        const el = ${BIGBOX};
+        if (!el) return false;
+        el.scrollIntoView({ block: 'center' });
+        el.focus();
+        return true;
+      })();
+    `, 90000);
+    if (!found) return { ok: false, message: 'TikTok: caption box nahi mila' };
+    await sleep(1050);
+
+    const wc = win.webContents;
+    await wc.executeJavaScript(`(function(){ const el=${BIGBOX}; if(el){ el.focus(); document.execCommand('selectAll'); document.execCommand('delete'); } return true; })();`);
+    await sleep(500);
+
+    const lines = String(text || '').split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i]) await wc.insertText(lines[i]);
+      if (i < lines.length - 1) {
+        wc.sendInputEvent({ type: 'keyDown', keyCode: 'Enter' });
+        wc.sendInputEvent({ type: 'char', keyCode: 'Enter' });
+        wc.sendInputEvent({ type: 'keyUp', keyCode: 'Enter' });
+        await sleep(200);
+      }
+    }
+    await sleep(700);
+
+    const clicked = await waitFor(win, `
+      (function () {
+        const b = [...document.querySelectorAll('button')].find(e =>
+          /^post$/i.test((e.innerText || '').trim()) &&
+          !e.disabled && e.getAttribute('aria-disabled') !== 'true' && e.getAttribute('data-disabled') !== 'true');
+        if (!b) return false;
+        b.click();
+        return true;
+      })();
+    `, 240000);
+    if (!clicked) return { ok: false, message: 'TikTok: Post button enable nahi hua' };
+
+    await sleep(1050);
+    await clickText(win, '^post now$');
+    const done = await waitFor(win, `/uploaded|manage your posts|video is being processed|posted|view post/i.test(document.body.innerText) || location.href.includes('/content')`, 60000);
+    return done
+      ? { ok: true, message: 'TikTok: post ho gayi' }
+      : { ok: false, message: 'TikTok: Post dabaya, Studio ke Posts me check karein' };
+  } finally {
+    await sleep(700);
+    win.close();
+  }
+}
+
+module.exports = { postToTikTok };
+
+===== D:\projects\social-poster\electron\util.cjs =====
+
+const { BrowserWindow, session } = require('electron');
+
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function makeWindow(name) {
+  const ses = session.fromPartition('persist:' + name);
+
+  // Extra settings to look more like real Chrome
+  ses.setUserAgent(UA);
+
+  const win = new BrowserWindow({
+    width: 1200,
+    height: 800,
+    show: true,
+    webPreferences: {
+      partition: 'persist:' + name,
+      nodeIntegration: false,
+      contextIsolation: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+    },
+  });
+
+  // Real Chrome jaisa user agent
+  win.webContents.setUserAgent(UA);
+
+  // Extra headers
+  win.webContents.session.webRequest.onBeforeSendHeaders((details, callback) => {
+    details.requestHeaders['User-Agent'] = UA;
+    details.requestHeaders['Accept-Language'] = 'en-US,en;q=0.9';
+    callback({ requestHeaders: details.requestHeaders });
+  });
+
+  return win;
+}
+
+async function waitFor(win, js, ms = 30000) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    try {
+      if (await win.webContents.executeJavaScript(js)) return true;
+    } catch (e) {}
+    await sleep(400);
+  }
+  return false;
+}
+
+function clickText(win, pattern, sel = 'div[role="button"], button, a') {
+  return win.webContents.executeJavaScript(`
+    (function () {
+      const re = new RegExp(${JSON.stringify(pattern)}, 'i');
+      const el = [...document.querySelectorAll(${JSON.stringify(sel)})]
+        .find(e => re.test((e.innerText || '').trim()));
+      if (!el) return false;
+      el.click();
+      return true;
+    })();
+  `);
+}
+
+async function setFile(win, selector, filePath) {
+  const dbg = win.webContents.debugger;
+  if (!dbg.isAttached()) dbg.attach('1.3');
+  const { root } = await dbg.sendCommand('DOM.getDocument', { depth: -1 });
+  const { nodeId } = await dbg.sendCommand('DOM.querySelector', {
+    nodeId: root.nodeId,
+    selector,
+  });
+  if (!nodeId) return false;
+  await dbg.sendCommand('DOM.setFileInputFiles', { nodeId, files: [filePath] });
+  return true;
+}
+
+async function ensureLogin(win, url) {
+  await win.loadURL(url);
+  await sleep(2100);
+  let waited = false;
+  for (let i = 0; i < 90; i++) {
+    const needs = await win.webContents
+      .executeJavaScript(`!!document.querySelector('input[type="password"]') || /\\/login/i.test(location.href)`)
+      .catch(() => true);
+    if (!needs) break;
+    waited = true;
+    await sleep(700);
+  }
+  if (waited) {
+    await win.loadURL(url);
+    await sleep(2100);
+  }
+}
+
+module.exports = { UA, sleep, makeWindow, waitFor, clickText, setFile, ensureLogin };
+
+===== D:\projects\social-poster\electron\whatsapp.cjs =====
+
+const { sleep, makeWindow } = require('./util.cjs');
+
+const CHANNEL_NAME = 'Makhdoom Brothers Podcast';
+// Broadcast lists (disabled: only the Channel is used)
+const BROADCAST_LISTS = [];
+
+const run = (win, code) => win.webContents.executeJavaScript(code, true);
+
+async function waitFor(win, expr, label, timeout = 20000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) {
+    try {
+      if (await run(win, `(() => { try { return !!(${expr}); } catch { return false; } })()`)) return;
+    } catch {}
+    await sleep(500);
+  }
+  throw new Error('Nahi mila: ' + label);
+}
+
+const clickAny = (win, selectors) => run(win, `(() => {
+  for (const s of ${JSON.stringify(selectors)}) {
+    const el = document.querySelector(s);
+    if (el) { (el.closest('button,[role="button"]') || el).click(); return true; }
+  }
+  return false;
+})()`);
+
+async function realClickAt(win, pos) {
+  const wc = win.webContents;
+  wc.sendInputEvent({ type: 'mouseMove', x: pos.x, y: pos.y });
+  await sleep(150);
+  wc.sendInputEvent({ type: 'mouseDown', x: pos.x, y: pos.y, button: 'left', clickCount: 1 });
+  await sleep(80);
+  wc.sendInputEvent({ type: 'mouseUp', x: pos.x, y: pos.y, button: 'left', clickCount: 1 });
+}
+
+async function realClickByText(win, name) {
+  const pos = await run(win, `(() => {
+    const name = ${JSON.stringify(name)};
+    const el = [...document.querySelectorAll('span[title], span')]
+      .find(e => (e.getAttribute('title') || e.textContent || '').trim().startsWith(name)
+                 && !e.closest('[contenteditable]')
+                 && e.getBoundingClientRect().left < 500
+                 && e.getBoundingClientRect().width > 0);
+    if (!el) return null;
+    el.scrollIntoView({ block: 'center' });
+    const r = el.getBoundingClientRect();
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+  })()`);
+  if (!pos) return false;
+  await realClickAt(win, pos);
+  return true;
+}
+
+const SEND_FIND = `(() => {
+  const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let el = [...document.querySelectorAll('[data-icon*="send"], [aria-label="Send"], [aria-label="send"]')].find(vis);
+  if (el) el = el.closest('button,[role="button"]') || el;
+  if (!el) {
+    el = [...document.querySelectorAll('button,[role="button"]')].filter(vis).filter(b => {
+      const r = b.getBoundingClientRect();
+      return r.width >= 40 && r.width <= 80 && Math.abs(r.width - r.height) < 6
+        && r.bottom > innerHeight - 200 && r.right > innerWidth - 150;
+    }).sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right)[0];
+  }
+  if (!el) return null;
+  const r = el.getBoundingClientRect();
+  return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+})()`;
+
+function findBoxJs(inFooter) {
+  return `(() => {
+    const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    const boxes = [...document.querySelectorAll('[contenteditable="true"]')]
+      .filter(vis)
+      .filter(b => !b.closest('#side') && !b.closest('#pane-side'))
+      .filter(b => b.getBoundingClientRect().left > 400)
+      .filter(b => ${inFooter ? '!!b.closest("footer")' : '!b.closest("footer")'});
+    const b = boxes[boxes.length - 1];
+    if (!b) return null;
+    const r = b.getBoundingClientRect();
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+  })()`;
+}
+
+// Finds the caption box in the media preview (outside or inside the footer)
+const CAPTION_FIND = `(() => {
+  const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const all = [...document.querySelectorAll('[contenteditable="true"]')]
+    .filter(vis)
+    .filter(b => !b.closest('#side') && !b.closest('#pane-side'))
+    .filter(b => b.getBoundingClientRect().left > 300);
+  let b = all.find(x => /caption/i.test((x.getAttribute('aria-label') || '') + ' ' + (x.getAttribute('data-tab') || '') + ' ' + (x.getAttribute('title') || '')));
+  if (!b) b = all.filter(x => !x.closest('footer'))[all.filter(x => !x.closest('footer')).length - 1];
+  if (!b) b = all[all.length - 1];
+  if (!b) return null;
+  const r = b.getBoundingClientRect();
+  return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+})()`;
+async function typeText(win, pos, text) {
+  await realClickAt(win, pos);
+  await sleep(400);
+  const wc = win.webContents;
+  wc.selectAll();
+  await sleep(100);
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i]) await wc.insertText(lines[i]);
+    if (i < lines.length - 1) {
+      wc.sendInputEvent({ type: 'keyDown', keyCode: 'Enter', modifiers: ['shift'] });
+      wc.sendInputEvent({ type: 'keyUp', keyCode: 'Enter', modifiers: ['shift'] });
+      await sleep(60);
+    }
+  }
+}
+
+async function clickSend(win) {
+  const pos = await run(win, SEND_FIND);
+  if (pos) { await realClickAt(win, pos); return; }
+  const wc = win.webContents;
+  wc.sendInputEvent({ type: 'keyDown', keyCode: 'Enter' });
+  wc.sendInputEvent({ type: 'keyUp', keyCode: 'Enter' });
+}
+
+// ---- Channel kholna ----
+async function openChannel(win) {
+  const sel = [
+    'button[aria-label="Channels"]',
+    '[aria-label="Channels"]',
+    '[data-navbar-item="channels"]',
+    '[data-icon*="newsletter"]',
+    '[data-icon*="channel"]',
+    'button[aria-label="Updates"]',
+    '[aria-label="Updates"]',
+    '[aria-label*="Updates"]',
+    '[data-navbar-item="updates"]',
+    '[data-icon*="status"]'
+  ];
+  if (!(await clickAny(win, sel))) throw new Error('Channels icon not found');
+  let found = false;
+  for (let i = 0; i < 8; i++) {
+    await sleep(1500);
+    if (await realClickByText(win, CHANNEL_NAME)) { found = true; break; }
+  }
+  if (!found) {
+    const seen = await run(win, `(() => [...document.querySelectorAll('span[title], span')]
+      .filter(e => e.getBoundingClientRect().left < 500 && e.getBoundingClientRect().width > 0 && e.children.length === 0)
+      .map(e => (e.getAttribute('title') || e.textContent || '').trim())
+      .filter(Boolean).slice(0, 60))()`);
+    console.log('[whatsapp] left panel texts:', JSON.stringify(seen));
+    throw new Error('Channel "' + CHANNEL_NAME + '" was not found in the list');
+  }
+  await sleep(1500);
+}
+
+// ---- Chats tab se naam search karke chat/broadcast list kholna ----
+async function openChatByName(win, name) {
+  const tab = [
+    'button[aria-label="Chats"]',
+    '[aria-label="Chats"]',
+    '[data-navbar-item="chats"]',
+    '[data-icon="chats-filled"]',
+    '[data-icon="chats-outline"]',
+    '[data-icon*="chats"]'
+  ];
+  if (!(await clickAny(win, tab))) throw new Error('Chats tab not found');
+  await sleep(1500);
+
+  const sp = await run(win, `(() => {
+    const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    const b = [...document.querySelectorAll('input[type="text"], input[type="search"], [role="textbox"], [contenteditable="true"]')]
+      .filter(vis)
+      .filter(e => !e.closest('footer') && e.getBoundingClientRect().left < 500)[0];
+    if (!b) return null;
+    const r = b.getBoundingClientRect();
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+  })()`);
+  if (!sp) throw new Error('Search box nahi mila');
+  await realClickAt(win, sp);
+  await sleep(400);
+  win.webContents.selectAll();
+  await sleep(100);
+  await win.webContents.insertText(name);
+  await sleep(2500);
+
+  if (!(await realClickByText(win, name))) {
+    throw new Error('"' + name + '" was not found. Check the list name and make sure it exists on your phone.');
+  }
+  await sleep(1500);
+}
+
+// ---- jo chat khuli hai us mein file + description bhejna ----
+async function sendInOpenChat(win, ctx, filePath, caption) {
+  ctx.step = 'message box';
+  await waitFor(win, `(${findBoxJs(true)}) !== null`, 'message/update box');
+  await sleep(800);
+
+  let captionDone = false;
+
+  if (filePath) {
+    ctx.step = 'file attach';
+    const opened = await clickAny(win, [
+      'footer button[aria-label="Attach"]',
+      'footer [data-icon="plus-rounded"]',
+      'footer [data-icon="plus"]',
+      'footer [data-icon="attach-menu-plus"]',
+      'footer [data-icon*="attach"]'
+    ]);
+    if (!opened) throw new Error('Attach button nahi mila');
+    await sleep(1500);
+    const dbg = win.webContents.debugger;
+    if (!dbg.isAttached()) dbg.attach('1.3');
+    await dbg.sendCommand('Page.enable');
+    await dbg.sendCommand('DOM.enable');
+    await dbg.sendCommand('Page.setInterceptFileChooserDialog', { enabled: true });
+    const chooser = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('File chooser did not open')), 15000);
+      const handler = (ev, method, params) => {
+        if (method === 'Page.fileChooserOpened') {
+          clearTimeout(timer);
+          dbg.removeListener('message', handler);
+          resolve(params);
+        }
+      };
+      dbg.on('message', handler);
+    });
+    chooser.catch(() => {});
+    let picked = false;
+    {
+      const pos = await run(win, `(() => {
+        const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+        const els = [...document.querySelectorAll('[aria-label],li,button,[role="button"],[role="menuitem"],span,div')].filter(vis)
+          .filter(e => (e.getAttribute('aria-label') || '') === 'Photos & videos' || (e.innerText || '').trim() === 'Photos & videos');
+        const el = els[0];
+        if (!el) return null;
+        const t = el.closest('li,button,[role="button"],[role="menuitem"]') || el;
+        const r = t.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })()`);
+      if (pos) { await realClickAt(win, pos); picked = true; }
+    }
+    if (!picked) picked = await realClickByText(win, 'Photos');
+    if (!picked) {
+      const items = await run(win, `[...document.querySelectorAll('[role="menuitem"],[role="button"],li,button,span')].filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.left > 300; }).map(e => ((e.getAttribute('aria-label') || '') + ' | ' + (e.innerText || '')).trim().slice(0, 40)).filter(Boolean)`);
+      require('fs').writeFileSync(require('path').join(__dirname, '..', 'wa_menu.txt'), JSON.stringify(items, null, 1));
+      throw new Error('Photos & videos option not found in attach menu');
+    }
+    const fc = await chooser;
+    await dbg.sendCommand('DOM.setFileInputFiles', { files: [filePath], backendNodeId: fc.backendNodeId });
+    try { await dbg.sendCommand('Page.setInterceptFileChooserDialog', { enabled: false }); } catch {}
+    try { dbg.detach(); } catch {}
+
+    ctx.step = 'preview (send button)';
+    await waitFor(win, `(${SEND_FIND}) !== null`, 'preview send button', 30000);
+    await sleep(2000);
+
+    ctx.step = 'description (preview)';
+    const capPos = await run(win, CAPTION_FIND);
+    if (capPos) {
+      await typeText(win, capPos, caption);
+      captionDone = true;
+      await sleep(800);
+    }
+
+    ctx.step = 'sending file';
+    await clickSend(win);
+    await sleep(5000);
+  }
+
+  if (!captionDone) {
+    ctx.step = 'sending description as separate message';
+    await waitFor(win, `(${findBoxJs(true)}) !== null`, 'message box (for description)');
+    const boxPos = await run(win, findBoxJs(true));
+    await typeText(win, boxPos, caption);
+    await sleep(800);
+    await clickSend(win);
+    await sleep(4000);
+  }
+}
+
+async function pressEsc(win) {
+  const wc = win.webContents;
+  for (let i = 0; i < 2; i++) {
+    wc.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
+    wc.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
+    await sleep(300);
+  }
+}
+
+async function postToWhatsAppChannel(text, file) {
+  const win = makeWindow('whatsapp');
+  const filePath = typeof file === 'string' ? file : file && file.path;
+  const caption = String(text || '').replace(/\*\*(.+?)\*\*/g, '*$1*').trim();
+  const ctx = { step: 'start' };
+
+  try {
+    if (!caption) throw new Error('The description is empty. Please add a description first.');
+
+    ctx.step = 'WhatsApp Web load';
+    await win.loadURL('https://web.whatsapp.com/');
+    try { win.show(); } catch {}
+
+    ctx.step = 'login (scan QR code)';
+    await waitFor(win,
+      `document.querySelector('#pane-side') || document.querySelector('[data-icon*="newsletter"]') || document.querySelector('[aria-label="Channels"]')`,
+      'WhatsApp login required. Scan the QR code with your phone, then try again.', 120000);
+    await sleep(1500);
+  } catch (e) {
+    return { ok: false, message: 'WhatsApp error (' + ctx.step + '): ' + e.message };
+  }
+
+  const targets = [
+    { label: 'Channel', open: () => openChannel(win) },
+    ...BROADCAST_LISTS.map(n => ({ label: n, open: () => openChatByName(win, n) }))
+  ];
+
+  const results = [];
+  for (let i = 0; i < targets.length; i++) {
+    const t = targets[i]; if (win.isDestroyed()) { results.push({ label: t.label, ok: false, err: "The WhatsApp window was closed. Please keep it open while posting." }); break; }
+    try {
+      ctx.step = 'opening ' + t.label;
+      await t.open();
+      await sendInOpenChat(win, ctx, filePath, caption);
+      results.push({ label: t.label, ok: true });
+    } catch (e) {
+      results.push({ label: t.label, ok: false, err: '(' + ctx.step + ') ' + e.message });
+      try { if (!win.isDestroyed()) await pressEsc(win); } catch {}
+    }
+    if (i < targets.length - 1) await sleep(6000 + Math.floor(Math.random() * 4000));
+  }
+
+  const ok = results.every(r => r.ok);
+  const message = results.map(r => r.ok ? r.label + ': posted' : r.label + ': ' + r.err).join(' | ');
+  return { ok, message };
+}
+
+module.exports = { postToWhatsAppChannel };
+
+
+
+
+
+
+
+
+===== D:\projects\social-poster\electron\youtube.cjs =====
+
+const fs = require('fs');
+const { spawn } = require('child_process');
+
+const DIR = 'C:\\SocialPosterData';
+const PORT = 9223;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function clean(s) { return String(s || '').replace(/\*\*/g, '').replace(/[<>]/g, ''); }
+
+async function postToYouTube(text, file) {
+  if (file && /\.(jpe?g|png)$/i.test(file)) {
+    const conv = await photoToVideo(file);
+    if (!conv.ok) return conv;
+    file = conv.path;
+  }
+  if (!file || !/\.(mp4|mov|webm)$/i.test(file))
+    return { ok: false, message: 'YouTube: sirf video choose karein (mp4, mov ya webm). Photo YouTube par upload nahi hoti.' };
+
+  let puppeteer, chrome;
+  try { puppeteer = require('puppeteer-core'); }
+  catch (e) { return { ok: false, message: 'YouTube: puppeteer-core is not installed. Run: cd D:\\projects\\makhdoom-postpro ; npm install puppeteer-core' }; }
+  try { chrome = require('./chrome.cjs'); }
+  catch (e) { return { ok: false, message: 'YouTube: electron\\chrome.cjs nahi mili' }; }
+  if (!chrome.CHROME) return { ok: false, message: 'YouTube: Google Chrome install nahi mila' };
+
+  let browser = null, page = null;
+  const fail = async (msg) => {
+    try { fs.mkdirSync(DIR, { recursive: true }); if (page) await page.screenshot({ path: DIR + '\\yt-fail.png' }); } catch (e) {}
+    return { ok: false, message: msg + ' (yt-fail.png dekhein)' };
+  };
+  const clickSel = (sel) => page.evaluate((s) => {
+    const e = document.querySelector(s);
+    if (!e) return false;
+    e.scrollIntoView({ block: 'center' });
+    e.click();
+    return true;
+  }, sel).catch(() => false);
+  const waitEnabled = (sel, ms) => page.waitForFunction((s) => {
+    const e = document.querySelector(s);
+    return !!e && !e.hasAttribute('disabled') && e.getAttribute('aria-disabled') !== 'true';
+  }, { timeout: ms, polling: 500 }, sel).then(() => true).catch(() => false);
+
+  try {
+    chrome.killProfileChrome();
+    await sleep(1500);
+    spawn(chrome.CHROME, [
+      '--user-data-dir=' + chrome.PROFILE,
+      '--remote-debugging-port=' + PORT,
+      '--disable-background-mode', '--disable-session-crashed-bubble', '--hide-crash-restore-bubble', '--no-first-run', '--no-default-browser-check',
+      '--new-window', '--start-minimized', 'about:blank',
+    ], { detached: true, stdio: 'ignore' }).unref();
+
+    for (let i = 0; i < 40 && !browser; i++) {
+      try { browser = await puppeteer.connect({ browserURL: 'http://127.0.0.1:' + PORT, defaultViewport: null }); }
+      catch (e) { await sleep(500); }
+    }
+    if (!browser) return { ok: false, message: 'YouTube: Chrome se connect nahi ho saka' };
+
+    const pages = await browser.pages();
+    page = pages[0] || await browser.newPage();
+    await page.bringToFront();
+    await page.goto('https://studio.youtube.com', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+
+    let chId = null;
+    for (let i = 0; i < 180 && !chId; i++) {
+      const m = page.url().match(/channel\/(UC[\w-]+)/);
+      if (m) chId = m[1]; else await sleep(1000);
+    }
+    if (!chId) return await fail('YouTube: Studio nahi khula ya login nahi hua. Pehle Login section se YouTube login karein');
+    await page.goto('https://studio.youtube.com/channel/' + chId + '/videos/upload?d=ud', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+    await sleep(1500);
+
+    const input = await page.waitForSelector('input[type="file"]', { timeout: 30000 }).catch(() => null);
+    if (!input) return await fail('YouTube: upload box nahi mila');
+    await input.uploadFile(file);
+
+    const lines = clean(text).split(/\r?\n/);
+    const title = (lines.map((l) => l.trim()).find((l) => l) || 'Video').slice(0, 95);
+
+    const titleBox = await page.waitForSelector('#title-textarea #textbox', { timeout: 90000 }).catch(() => null);
+    if (!titleBox) {
+      const limit = await page.evaluate(() => /upload limit|verify your account|daily upload/i.test(document.body.innerText)).catch(() => false);
+      return await fail(limit ? 'YouTube: daily upload limit ya account verification ka masla' : 'YouTube: title box nahi mila');
+    }
+    await page.evaluate((t) => {
+      const box = document.querySelector('#title-textarea #textbox');
+      box.focus();
+      document.execCommand('selectAll');
+      document.execCommand('insertText', false, t);
+    }, title);
+
+    if (text) {
+      await page.evaluate((ls) => {
+        const d = document.querySelector('#description-textarea #textbox');
+        if (!d) return false;
+        d.focus();
+        ls.forEach((l, i) => {
+          if (i > 0) { if (!document.execCommand('insertLineBreak')) document.execCommand('insertParagraph'); }
+          if (l) document.execCommand('insertText', false, l);
+        });
+        return true;
+      }, lines);
+    }
+    await sleep(700);
+
+    await clickSel('[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"]');
+    await sleep(500);
+    await clickSel('[name*="ALTERED_CONTENT_NO"]');
+    await sleep(500);
+
+    for (let i = 0; i < 3; i++) {
+      if (!(await waitEnabled('#next-button', 60000)))
+        return await fail('YouTube: Next button enable nahi hua (qadam ' + (i + 1) + ')');
+      await sleep(500);
+      await clickSel('#next-button');
+      await sleep(900);
+    }
+
+    await clickSel('[name="PUBLIC"]');
+    await sleep(700);
+
+    if (!(await waitEnabled('#done-button', 900000)))
+      return await fail('YouTube: Done button 15 minute tak enable nahi hua, upload poora nahi hua');
+    await sleep(800);
+    await clickSel('#done-button');
+
+    let confirmed = false;
+    for (let i = 0; i < 60; i++) {
+      await sleep(1000);
+      const ok = await page.evaluate(() =>
+        /video published|video uploaded|upload complete|video is now (live|public)/i.test(document.body.innerText) ||
+        !document.querySelector('ytcp-uploads-dialog')
+      ).catch(() => false);
+      if (ok) { confirmed = true; break; }
+    }
+    await clickSel('#close-button');
+    try { fs.mkdirSync(DIR, { recursive: true }); await page.screenshot({ path: DIR + '\\yt-after.png' }); } catch (e) {}
+    return confirmed
+      ? { ok: true, message: 'YouTube: video publish ho gayi (Studio mein check kar lein)' }
+      : await fail('YouTube: Done dabaya lekin confirm nahi aaya, Studio mein check karein');
+  } finally {
+    try { if (browser) await browser.disconnect(); } catch (e) {}
+    await sleep(2000);
+    try { chrome.killProfileChrome(); } catch (e) {}
+  }
+}
+
+function photoToVideo(img) {
+  return new Promise((resolve) => {
+    let ff;
+    try { ff = require('ffmpeg-static'); }
+    catch (e) { return resolve({ ok: false, message: 'YouTube: ffmpeg-static is not installed. Run: cd D:\\projects\\makhdoom-postpro ; npm install ffmpeg-static' }); }
+    try { fs.mkdirSync(DIR, { recursive: true }); } catch (e) {}
+    const out = DIR + '\\yt-photo.mp4';
+    const vf = 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p';
+    const args = ['-y', '-loop', '1', '-i', img, '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
+      '-t', '6', '-vf', vf, '-r', '30', '-c:v', 'libx264', '-tune', 'stillimage',
+      '-c:a', 'aac', '-shortest', '-movflags', '+faststart', out];
+    const pr = spawn(ff, args, { stdio: 'ignore' });
+    pr.on('error', () => resolve({ ok: false, message: 'YouTube: photo ko video banane me masla (ffmpeg chala nahi)' }));
+    pr.on('exit', (c) => resolve(c === 0 ? { ok: true, path: out } : { ok: false, message: 'YouTube: photo ko video banane me masla' }));
+  });
+}
+
+module.exports = { postToYouTube };
+
+===== D:\projects\social-poster\electron\youtube_backup.cjs =====
+
+const { sleep, makeWindow, waitFor, clickText, setFile, ensureLogin } = require('./util.cjs');
+
+const run = (win, code) => win.webContents.executeJavaScript(code).catch(() => false);
+const clickSel = (win, sel) =>
+  run(win, `(function(){const e=document.querySelector(${JSON.stringify(sel)}); if(!e) return false; e.click(); return true;})()`);
+
+async function postToYouTube(text, file) {
+  if (!file || !/\.(mp4|mov|webm)$/i.test(file))
+    return { ok: false, message: 'YouTube: sirf video choose karein' };
+  const win = makeWindow('youtube');
+  try {
+    await ensureLogin(win, 'https://studio.youtube.com');
+    await sleep(1050);
+
+    if (!(await waitFor(win, `!!document.querySelector('#create-icon')`, 30000)))
+      return { ok: false, message: 'YouTube: Create button nahi mila (login check karein)' };
+    await clickSel(win, '#create-icon');
+    await sleep(525);
+    await clickSel(win, '#text-item-0');
+
+    if (!(await waitFor(win, `!!document.querySelector('input[type="file"]')`, 30000)))
+      return { ok: false, message: 'YouTube: upload box nahi mila' };
+    if (!(await setFile(win, 'input[type="file"]', file)))
+      return { ok: false, message: 'YouTube: file attach nahi hui' };
+
+    const title = (text || 'Video').split('\n')[0].slice(0, 95);
+    const titleOk = await waitFor(win, `
+      (function () {
+        const box = document.querySelector('#title-textarea #textbox');
+        if (!box) return false;
+        box.focus();
+        document.execCommand('selectAll');
+        document.execCommand('insertText', false, ${JSON.stringify(title)});
+        return true;
+      })();
+    `, 90000);
+    if (!titleOk) return { ok: false, message: 'YouTube: title box nahi mila' };
+
+    if (text) {
+      await run(win, `
+        (function () {
+          const d = document.querySelector('#description-textarea #textbox');
+          if (!d) return false;
+          d.focus();
+          document.execCommand('insertText', false, ${JSON.stringify(text)});
+          return true;
+        })();
+      `);
+    }
+
+    await clickSel(win, '[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"]');
+    for (let i = 0; i < 3; i++) {
+      await sleep(525);
+      await clickSel(win, '#next-button');
+    }
+    await sleep(525);
+    await clickSel(win, '[name="PUBLIC"]');
+    await sleep(525);
+    const done = await clickSel(win, '#done-button');
+    await sleep(3500);
+    return done
+      ? { ok: true, message: 'YouTube: upload ho gayi (Studio mein check kar lein)' }
+      : { ok: false, message: 'YouTube: Done button nahi mila, check karein' };
+  } finally {
+    await sleep(700);
+    win.close();
+  }
+}
+
+module.exports = { postToYouTube };
+
+===== D:\projects\social-poster\electron\youtube_backup2.cjs =====
+
+const { sleep, makeWindow, waitFor, setFile, ensureLogin } = require('./util.cjs');
+const fs = require('fs');
+const DIR = 'C:\\SocialPosterData';
+
+async function shot(win, name) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const img = await win.webContents.capturePage();
+    fs.writeFileSync(DIR + '\\' + name + '.png', img.toPNG());
+  } catch (e) {}
+}
+
+const run = (win, code) => win.webContents.executeJavaScript(code).catch(() => false);
+
+const clickSel = (win, sel) =>
+  run(win, `(function(){const e=document.querySelector(${JSON.stringify(sel)}); if(!e) return false; e.scrollIntoView({block:'center'}); e.click(); return true;})()`);
+
+const isEnabled = (sel) =>
+  `(function(){const e=document.querySelector(${JSON.stringify(sel)}); return !!e && !e.hasAttribute('disabled') && e.getAttribute('aria-disabled')!=='true';})()`;
+
+function clean(s) { return String(s || '').replace(/\*\*/g, '').replace(/[<>]/g, ''); }
+
+async function fail(win, msg) {
+  await shot(win, 'yt-fail');
+  return { ok: false, message: msg + ' (yt-fail.png dekhein)' };
+}
+
+async function postToYouTube(text, file) {
+  if (!file || !/\.(mp4|mov|webm)$/i.test(file))
+    return { ok: false, message: 'YouTube: sirf video choose karein (mp4, mov ya webm). Photo YouTube par upload nahi hoti.' };
+  const win = makeWindow('youtube');
+  try {
+    await ensureLogin(win, 'https://studio.youtube.com');
+    await sleep(1050);
+
+    if (!(await waitFor(win, `!!document.querySelector('#create-icon')`, 30000)))
+      return await fail(win, 'YouTube: Create button nahi mila (login check karein)');
+    await clickSel(win, '#create-icon');
+    await sleep(700);
+    await clickSel(win, '#text-item-0');
+
+    if (!(await waitFor(win, `!!document.querySelector('input[type="file"]')`, 30000)))
+      return await fail(win, 'YouTube: upload box nahi mila');
+    if (!(await setFile(win, 'input[type="file"]', file)))
+      return await fail(win, 'YouTube: file attach nahi hui');
+
+    const lines = clean(text).split(/\r?\n/);
+    const title = (lines.map(l => l.trim()).find(l => l) || 'Video').slice(0, 95);
+
+    const titleOk = await waitFor(win, `
+      (function () {
+        const box = document.querySelector('#title-textarea #textbox');
+        if (!box) return false;
+        box.focus();
+        document.execCommand('selectAll');
+        document.execCommand('insertText', false, ${JSON.stringify(title)});
+        return true;
+      })();
+    `, 90000);
+    if (!titleOk) {
+      const limit = await run(win, `/upload limit|verify your account|daily upload/i.test(document.body.innerText)`);
+      return await fail(win, limit ? 'YouTube: daily upload limit ya account verification ka masla' : 'YouTube: title box nahi mila');
+    }
+
+    if (text) {
+      await run(win, `
+        (function () {
+          const d = document.querySelector('#description-textarea #textbox');
+          if (!d) return false;
+          d.focus();
+          const lines = ${JSON.stringify(lines)};
+          lines.forEach(function (l, i) {
+            if (i > 0) { if (!document.execCommand('insertLineBreak')) document.execCommand('insertParagraph'); }
+            if (l) document.execCommand('insertText', false, l);
+          });
+          return true;
+        })();
+      `);
+    }
+    await sleep(700);
+
+    // Made for kids: No
+    await clickSel(win, '[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"]');
+    await sleep(500);
+    // Altered content: No (agar ye sawal aaye)
+    await clickSel(win, '[name*="ALTERED_CONTENT_NO"]');
+    await sleep(500);
+
+    // Next x3 (har dafa pehle enabled hone ka intezar)
+    for (let i = 0; i < 3; i++) {
+      if (!(await waitFor(win, isEnabled('#next-button'), 60000)))
+        return await fail(win, 'YouTube: Next button enable nahi hua (qadam ' + (i + 1) + ')');
+      await sleep(500);
+      await clickSel(win, '#next-button');
+      await sleep(900);
+    }
+
+    await clickSel(win, '[name="PUBLIC"]');
+    await sleep(700);
+
+    // upload poora hone tak Done enable nahi hota (15 minute tak intezar)
+    if (!(await waitFor(win, isEnabled('#done-button'), 900000)))
+      return await fail(win, 'YouTube: Done button 15 minute tak enable nahi hua, upload poora nahi hua');
+    await sleep(800);
+    await clickSel(win, '#done-button');
+
+    // confirm: published dialog ya upload dialog ka band hona
+    let confirmed = false;
+    for (let i = 0; i < 60; i++) {
+      await sleep(1000);
+      const ok = await run(win, `
+        (function () {
+          const t = document.body.innerText || '';
+          return /video published|video uploaded|upload complete|video is now (live|public)/i.test(t) || !document.querySelector('ytcp-uploads-dialog');
+        })();
+      `);
+      if (ok) { confirmed = true; break; }
+    }
+    await clickSel(win, '#close-button');
+    await shot(win, 'yt-after');
+    return confirmed
+      ? { ok: true, message: 'YouTube: video publish ho gayi (Studio mein check kar lein)' }
+      : await fail(win, 'YouTube: Done dabaya lekin confirm nahi aaya, Studio mein check karein');
+  } finally {
+    await sleep(700);
+    win.close();
+  }
+}
+
+module.exports = { postToYouTube };
+
+===== D:\projects\social-poster\src\App.jsx =====
+
+import { useState, useEffect, useRef } from 'react';
+import './App.css';
+
+const NAMES = ['facebook', 'instagram', 'tiktok', 'youtube', 'whatsapp'];
+const NEED_FILE = ['instagram', 'tiktok', 'youtube'];
+const COLORS = {
+  facebook: '#1877f2', instagram: '#e1306c', tiktok: '#111111',
+  youtube: '#ff0000', whatsapp: '#25d366',
+};
+const TYPES = [['post', 'Post'], ['reel', 'Video / Reel'], ['story', 'Story']];
+const H_KEY = 'sp_history';
+const S_KEY = 'sp_scheduled';
+const T_KEY = 'sp_theme';
+
+const load = (k) => { try { return JSON.parse(localStorage.getItem(k)) || []; } catch { return []; } };
+const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* ignore */ } };
+const fmt = (iso) => new Date(iso).toLocaleString('en-GB', {
+  day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
+});
+const pad = (n) => String(n).padStart(2, '0');
+const toLocalInput = (d) =>
+  `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+const typeLabel = (t) => (TYPES.find((x) => x[0] === t) || [t, t])[1];
+const typesOf = (j) => j.postTypes || [j.postType];
+const typesText = (j) => typesOf(j).map(typeLabel).join(' + ');
+
+const ICONS = {
+  edit: 'M12 20h9M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z',
+  clock: 'M12 3a9 9 0 100 18 9 9 0 000-18zM12 7v5l3 2',
+  hist: 'M3 12a9 9 0 109-9 9 9 0 00-6.4 2.6L3 8M3 3v5h5M12 8v4l3 2',
+  user: 'M12 4a4 4 0 100 8 4 4 0 000-8zM4 21c0-4 4-6 8-6s8 2 8 6',
+  send: 'M22 2L11 13M22 2l-7 20-4-9-9-4z',
+  img: 'M5 3h14a2 2 0 012 2v14a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2zM21 15l-5-5L5 21',
+  chk: 'M5 12l5 5 9-10',
+  moon: 'M21 12.8A9 9 0 1111.2 3a7 7 0 009.8 9.8z',
+};
+const Ic = ({ n }) => (
+  <svg viewBox="0 0 24 24" className="ic"><path d={ICONS[n]} /></svg>
+);
+
+const mediaUrl = (p) => 'media://local/' + encodeURIComponent(p);
+const isVideo = (p) => /\.(mp4|mov|webm|mkv|avi|m4v)$/i.test(p || '');
+const Media = ({ path }) => {
+  const [bad, setBad] = useState(false);
+  if (!path) return null;
+  const name = path.split('\\').pop();
+  if (bad) return <div className="media media-fb">{name}</div>;
+  return isVideo(path)
+    ? <video className="media" src={mediaUrl(path)} controls preload="metadata" onError={() => setBad(true)} />
+    : <img className="media" src={mediaUrl(path)} alt={name} onError={() => setBad(true)} />;
+};
+
+const Dot = ({ p }) => (
+  <span className="dot" style={{ background: COLORS[p] }}>{p[0]}</span>
+);
+
+export default function App() {
+  const [tab, setTab] = useState('new');
+  const [theme, setTheme] = useState(() => {
+    try { return localStorage.getItem(T_KEY) || 'light'; } catch { return 'light'; }
+  });
+  const [postTypes, setPostTypes] = useState(['post']);
+  const [text, setText] = useState('');
+  const [description, setDescription] = useState('');
+  const [descs, setDescs] = useState({});
+  const [purpose, setPurpose] = useState('');
+  const [files, setFiles] = useState({});
+  const [platforms, setPlatforms] = useState({
+    facebook: false, instagram: false, tiktok: false, youtube: false, whatsapp: false,
+  });
+  const [mode, setMode] = useState('now');
+  const [whenStr, setWhenStr] = useState('');
+  const [perPlat, setPerPlat] = useState(false);
+  const [whens, setWhens] = useState({});
+  const [testMode, setTestMode] = useState(true);
+  const [results, setResults] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [loginMsg, setLoginMsg] = useState('');
+  const [history, setHistory] = useState(() => load(H_KEY));
+  const [scheduled, setScheduled] = useState(() =>
+    load(S_KEY).map((j) =>
+      j.status === 'pending' && new Date(j.when).getTime() < Date.now() - 2 * 60 * 1000
+        ? { ...j, status: 'missed' } : j
+    )
+  );
+
+  const busyRef = useRef(false);
+  const schedRef = useRef(scheduled);
+  const runRef = useRef(null);
+  schedRef.current = scheduled;
+
+  useEffect(() => {
+    window.api.onLoginStep((m) => setLoginMsg(m));
+  }, []);
+
+  const flipTheme = () => {
+    const n = theme === 'dark' ? 'light' : 'dark';
+    setTheme(n);
+    try { localStorage.setItem(T_KEY, n); } catch { /* ignore */ }
+  };
+
+  const updateScheduled = (fn) => setScheduled((prev) => {
+    const n = fn(prev);
+    save(S_KEY, n);
+    return n;
+  });
+
+  const addHistory = (entries) => setHistory((prev) => {
+    const n = [...entries, ...prev].slice(0, 500);
+    save(H_KEY, n);
+    return n;
+  });
+
+  const runJob = async (job) => {
+    busyRef.current = true;
+    setLoading(true);
+    setResults([{ loading: true, message: job.dryRun ? 'Test mode is running...' : 'Publishing in progress... a new app window will open. Please do not click anything.' }]);
+    const out = [];
+    const entries = [];
+    const jfiles = job.files || { [job.postType]: job.file };
+    for (const t of typesOf(job)) {
+      for (const p of job.platforms) {
+        let rs;
+        try {
+          const res = await window.api.postAll({
+            text: job.text, description: job.descs[p], file: jfiles[t] || null,
+            platforms: [p], dryRun: job.dryRun, postType: t,
+          });
+          rs = res && res.results && res.results.length ? res.results : [{ ok: false, message: 'No results were returned' }];
+        } catch (e) {
+          rs = [{ ok: false, message: 'Error: ' + e.message }];
+        }
+        const ok = rs.every((x) => x.ok);
+        const message = rs.map((x) => x.message).join(' | ');
+        out.push({ ok, message: typeLabel(t) + ' / ' + p + ': ' + message });
+        entries.push({
+          id: job.id + '-' + t + '-' + p, platform: p, postType: t, purpose: job.purpose,
+          text: job.text, description: job.descs[p], file: jfiles[t] || null, ok, message,
+          postedAt: new Date().toISOString(), scheduledFor: job.when || null, dryRun: job.dryRun,
+        });
+      }
+    }
+    addHistory(entries);
+    setResults(out);
+    busyRef.current = false;
+    setLoading(false);
+  };
+  runRef.current = runJob;
+
+  // Har 10 second mein dekhta hai ke koi schedule hui post ka waqt aa gaya?
+  useEffect(() => {
+    const t = setInterval(() => {
+      if (busyRef.current) return;
+      const now = Date.now();
+      const due = schedRef.current.find((j) => j.status === 'pending' && new Date(j.when).getTime() <= now);
+      if (due) {
+        updateScheduled((prev) => prev.filter((j) => j.id !== due.id));
+        runRef.current(due);
+      }
+    }, 10000);
+    return () => clearInterval(t);
+  }, []);
+
+  const selected = Object.keys(platforms).filter((p) => platforms[p]);
+  const effDesc = (p) => (descs[p] && descs[p].trim()) || description;
+  const needFor = (t) => (t !== 'post' ? selected : NEED_FILE.filter((p) => selected.includes(p)));
+  const missing = postTypes.filter((t) => !files[t] && needFor(t).length > 0).map((t) => ({ t, list: needFor(t) }));
+  const anyFile = postTypes.some((t) => files[t]);
+  const allDesc = selected.length > 0 && selected.every((p) => effDesc(p).trim().length > 0);
+  const whenFor = (p) => whens[p] || whenStr;
+  const future = (v) => !!v && new Date(v).getTime() > Date.now();
+  const whenOk = mode === 'now' || (perPlat
+    ? selected.length > 0 && selected.every((p) => future(whenFor(p)))
+    : future(whenStr));
+  const canPost = !loading && selected.length > 0 && missing.length === 0 && allDesc
+    && (text.trim() || anyFile) && whenOk;
+
+  const toggle = (name) => setPlatforms({ ...platforms, [name]: !platforms[name] });
+
+  const toggleType = (id) => setPostTypes((prev) => (prev.includes(id)
+    ? (prev.length > 1 ? prev.filter((x) => x !== id) : prev)
+    : TYPES.map((x) => x[0]).filter((x) => x === id || prev.includes(x))));
+
+  const choose = async (t) => {
+    const f = await window.api.pickFile();
+    if (f) setFiles((prev) => ({ ...prev, [t]: f }));
+  };
+
+  const submit = () => {
+    const dMap = {};
+    selected.forEach((p) => { dMap[p] = effDesc(p); });
+    const job = {
+      id: 'j' + Date.now(), postTypes, files, text, platforms: selected, descs: dMap,
+      purpose: purpose.trim(), dryRun: testMode,
+      when: mode === 'later' && !perPlat ? new Date(whenStr).toISOString() : null,
+      status: 'pending',
+    };
+    if (mode === 'later') {
+      const jobs = perPlat
+        ? selected.map((p) => ({
+          ...job, id: job.id + '-' + p, platforms: [p], descs: { [p]: dMap[p] },
+          when: new Date(whenFor(p)).toISOString(),
+        }))
+        : [job];
+      updateScheduled((prev) => [...prev, ...jobs].sort((a, b) => new Date(a.when) - new Date(b.when)));
+      setResults(jobs.map((j) => ({
+        ok: true,
+        message: j.platforms.join(', ') + ': scheduled for ' + fmt(j.when) + '. Keep the app open, otherwise the post will not be published.',
+      })));
+      setTab('scheduled');
+      return;
+    }
+    if (!testMode) {
+      const ok = window.confirm(
+        'A live post is about to be published!\n\nType: ' + postTypes.map(typeLabel).join(' + ') +
+        '\nPlatform: ' + selected.join(', ') + '\n\nAre you sure you want to publish?'
+      );
+      if (!ok) return;
+    }
+    runJob(job);
+  };
+
+  const deleteHistory = (id) => {
+    if (!window.confirm('Remove this entry from history?')) return;
+    setHistory((prev) => {
+      const n = prev.filter((x) => x.id !== id);
+      save(H_KEY, n);
+      return n;
+    });
+  };
+
+  const postMissedNow = (job) => {
+    if (busyRef.current) return;
+    updateScheduled((prev) => prev.filter((j) => j.id !== job.id));
+    setTab('new');
+    runJob(job);
+  };
+
+  const NAV = [
+    ['new', 'New Post', 'edit', null],
+    ['scheduled', 'Scheduled', 'clock', scheduled.length],
+    ['history', 'History', 'hist', history.length],
+    ['login', 'Login', 'user', null],
+  ];
+  const TITLES = {
+    new: ['New Post', 'Write your content, choose your platforms, and publish.'],
+    scheduled: ['Scheduled', 'Posts scheduled for a set time.'],
+    history: ['History', 'Record of your previous posts.'],
+    login: ['Login', 'Connect your accounts.'],
+  };
+
+  return (
+    <div className="shell" data-theme={theme}>
+      <aside>
+        <div className="brand"><div className="mark"><Ic n="send" /></div>Makhdoom PostPro</div>
+        {NAV.map(([id, label, ic, count]) => (
+          <button key={id} className={'nav' + (tab === id ? ' on' : '')} onClick={() => setTab(id)}>
+            <Ic n={ic} />{label}
+            {count !== null && <span className="b">{count}</span>}
+          </button>
+        ))}
+        <div className="side-foot"><b>One Post, Everywhere</b>Write once and publish to all your selected platforms.</div>
+      </aside>
+
+      <main>
+        <div className="top">
+          <div><h1>{TITLES[tab][0]}</h1><p>{TITLES[tab][1]}</p></div>
+          <div className="sp" />
+          <span className={'pill' + (testMode ? '' : ' live')}>{testMode ? 'Test mode' : 'Live mode'}</span>
+          <button className="icon-btn" onClick={flipTheme} aria-label="Theme badlo"><Ic n="moon" /></button>
+        </div>
+
+        {tab === 'new' && (
+          <div className="layout">
+            <div>
+              <div className="card">
+                <h2>What would you like to post?</h2>
+                <p className="sub">Select one or more types. All will be published together.</p>
+                <div className="kinds">
+                  {TYPES.map(([id, label]) => (
+                    <button key={id} className={'kind' + (postTypes.includes(id) ? ' on' : '')} onClick={() => toggleType(id)}>
+                      <span className="cb"><Ic n="chk" /></span>{label}
+                    </button>
+                  ))}
+                </div>
+                <div className="stack">
+                  <div>
+                    <div className="fl">Post Text<span>{text.length} characters</span></div>
+                    <textarea className="in" placeholder="Write your post here..." value={text} onChange={(e) => setText(e.target.value)} />
+                  </div>
+                  <div>
+                    <div className="fl"><div>Description<em>*</em> <span>for all platforms, required</span></div><span>{description.length} characters</span></div>
+                    <textarea className="in sm" placeholder="Write your description here (required)..." value={description} onChange={(e) => setDescription(e.target.value)} />
+                  </div>
+                  <div>
+                    <div className="fl">Purpose <span>note, shown in history</span></div>
+                    <input type="text" className="in" placeholder="e.g. Eid offer, new product, event..." value={purpose} onChange={(e) => setPurpose(e.target.value)} />
+                  </div>
+                  {postTypes.map((t) => (
+                    <div key={t}>
+                      <div className="fl">{typeLabel(t)} Photo / Video</div>
+                      <div className="drop" onClick={() => choose(t)}>
+                        <div className="thumb"><Ic n="img" /></div>
+                        <div>
+                          <b>{files[t] ? 'File selected' : 'Choose a file'}</b>
+                          <small>{files[t] ? files[t].split('\\').pop() : 'jpg, png, mp4, mov'}</small>
+                        </div>
+                        {files[t] && (
+                          <button className="link" onClick={(e) => { e.stopPropagation(); setFiles((prev) => ({ ...prev, [t]: null })); }}>Remove</button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="card">
+                <h2>Where would you like to post?</h2>
+                <p className="sub">Select one or more platforms.</p>
+                <div className="plats">
+                  {NAMES.map((p) => (
+                    <div key={p} className={'plat' + (platforms[p] ? ' on' : '')} onClick={() => toggle(p)}>
+                      <Dot p={p} />{p}
+                      <span className="tick"><Ic n="chk" /></span>
+                    </div>
+                  ))}
+                </div>
+                {missing.map(({ t, list }) => (
+                  <div key={t} className="warn">A photo/video is required for {typeLabel(t)} ({list.join(', ')}). Please choose a file first.</div>
+                ))}
+                {selected.length > 0 && (
+                  <div className="stack" style={{ marginTop: 18 }}>
+                    <div>
+                      <div className="fl">Platform-Specific Descriptions</div>
+                      <small className="muted">Optional. If left blank, the description above will be used.</small>
+                    </div>
+                    {selected.map((p) => (
+                      <div key={p}>
+                        <div className="fl"><div className="who"><Dot p={p} />{p}</div></div>
+                        <textarea
+                          className="in sm"
+                          placeholder={'Sirf ' + p + ' ke liye alag description...'}
+                          value={descs[p] || ''}
+                          onChange={(e) => setDescs({ ...descs, [p]: e.target.value })}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="card">
+                <h2>When would you like to post?</h2>
+                <p className="sub">Publish now or schedule for later.</p>
+                <div className="when">
+                  <button className={'opt' + (mode === 'now' ? ' on' : '')} onClick={() => setMode('now')}>
+                    <span className="rd" /><span><b>Post Now</b><small>Publish immediately</small></span>
+                  </button>
+                  <button
+                    className={'opt' + (mode === 'later' ? ' on' : '')}
+                    onClick={() => { setMode('later'); if (!whenStr) setWhenStr(toLocalInput(new Date(Date.now() + 60 * 60 * 1000))); }}
+                  >
+                    <span className="rd" /><span><b>Schedule for Later</b><small>Choose a date and time</small></span>
+                  </button>
+                </div>
+                {mode === 'later' && (
+                  <div style={{ marginTop: 12 }}>
+                    <label className="tg" style={{ marginTop: 0, marginBottom: 14 }}>
+                      <input type="checkbox" checked={perPlat} onChange={(e) => setPerPlat(e.target.checked)} />
+                      <span className="sw" />
+                      <span><b>Separate time for each platform</b><small>Choose a separate date and time for each platform</small></span>
+                    </label>
+                    {perPlat ? (
+                      selected.length === 0
+                        ? <small className="muted">Please select a platform above first.</small>
+                        : (
+                          <div className="stack">
+                            {selected.map((p) => (
+                              <div key={p} className="prow">
+                                <div className="who"><Dot p={p} />{p}</div>
+                                <input
+                                  type="datetime-local" className="in" value={whenFor(p)}
+                                  min={toLocalInput(new Date())}
+                                  onChange={(e) => setWhens({ ...whens, [p]: e.target.value })}
+                                />
+                              </div>
+                            ))}
+                          </div>
+                        )
+                    ) : (
+                      <input type="datetime-local" className="in" value={whenStr} min={toLocalInput(new Date())} onChange={(e) => setWhenStr(e.target.value)} />
+                    )}
+                    {!whenOk && <div className="warn">Aane wala waqt chunein.</div>}
+                    <small className="muted" style={{ display: 'block', marginTop: 8 }}>Schedule tab hi chalegi jab app khuli ho aur PC on ho.</small>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="sticky">
+              <div className="card">
+                <h2>Preview</h2>
+                <p className="sub">This is how your post will appear.</p>
+                <div className="pv">
+                  <div className="pv-h"><div className="av">SP</div><div><b>Your Page</b><small>{postTypes.map(typeLabel).join(' + ')} &middot; {mode === 'later' ? (perPlat ? 'Separate times' : whenStr ? fmt(whenStr) : 'Scheduled') : 'Just now'}</small></div></div>
+                  <div className={'pv-img' + (postTypes.some((t) => files[t]) ? ' has' : '')}>
+                    {postTypes.some((t) => files[t])
+                      ? postTypes.filter((t) => files[t]).map((t) => <Media key={t + files[t]} path={files[t]} />)
+                      : 'No file selected'}
+                  </div>
+                  <div className={'pv-t' + (text.trim() ? '' : ' ph')}>{text.trim() || 'Your post preview will appear here...'}</div>
+                  <div className="tags">{selected.map((p) => <span key={p} className="tag">{p}</span>)}</div>
+                </div>
+                <label className="tg">
+                  <input type="checkbox" checked={testMode} onChange={(e) => setTestMode(e.target.checked)} />
+                  <span className="sw" />
+                  <span><b>Test mode</b><small>{testMode ? 'ON: no live post will be published' : 'OFF: your post will be published live!'}</small></span>
+                </label>
+                <button className="go" disabled={!canPost} onClick={submit}>
+                  <Ic n="send" />
+                  {loading ? 'Please wait...' : mode === 'later' ? 'Schedule Post' : testMode ? 'Run Test (no live post)' : 'Publish Post'}
+                </button>
+              </div>
+
+              {results.length > 0 && (
+                <div className="card">
+                  <h2>Results</h2>
+                  {results.map((r, i) => (
+                    <div key={i} className={'row ' + (r.loading ? 'load' : r.ok ? 'ok' : 'bad')}>
+                      <span className="badge">{r.loading ? '...' : r.ok ? 'OK' : 'X'}</span>
+                      <span>{r.message}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {tab === 'scheduled' && (
+          <div className="card">
+            <h2>Scheduled Posts</h2>
+            {scheduled.length === 0 && <p className="sub">No scheduled posts.</p>}
+            {scheduled.map((j) => (
+              <div key={j.id} className={'item ' + (j.status === 'missed' ? 'bad' : '')}>
+                <div className="grow">
+                  <b>{typesText(j)}</b> &rarr; {j.platforms.join(', ')}{j.dryRun && ' (TEST)'}
+                  <small className="muted">{j.status === 'missed' ? 'Miss ho gayi (app band thi): ' : 'Waqt: '}{fmt(j.when)}</small>
+                  {j.purpose && <small className="muted">Purpose: {j.purpose}</small>}
+                  <small className="muted">{(j.text || '').slice(0, 80)}</small>
+                </div>
+                <div className="acts">
+                  {j.status === 'missed' && <button className="mini" onClick={() => postMissedNow(j)}>Post Now</button>}
+                  <button className="mini del" onClick={() => updateScheduled((prev) => prev.filter((x) => x.id !== j.id))}>Remove</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {tab === 'history' && (
+          <div className="card">
+            <div className="hrow">
+              <h2>History</h2>
+              {history.length > 0 && (
+                <button
+                  className="mini del"
+                  onClick={() => { if (window.confirm('Delete the entire history?')) { setHistory([]); save(H_KEY, []); } }}
+                >Clear History</button>
+              )}
+            </div>
+            {history.length === 0 && <p className="sub">No history yet.</p>}
+            {history.map((h) => (
+              <div key={h.id} className={'item ' + (h.ok ? '' : 'bad')}>
+                <Media path={h.file} />
+                <div className="grow">
+                  <div className="who"><Dot p={h.platform} /><b>{h.platform}</b><span className={'kindtag ' + h.postType}>{typeLabel(h.postType)}</span>{h.dryRun && <span className="kindtag">TEST</span>}<span className={'kindtag ' + (h.ok ? 'okt' : 'badt')}>{h.ok ? 'OK' : 'Fail'}</span></div>
+                  <small className="date">Date: {fmt(h.postedAt)}{h.scheduledFor ? ' (schedule: ' + fmt(h.scheduledFor) + ')' : ''}</small>
+                  {h.purpose && <small className="muted">Purpose: {h.purpose}</small>}
+                  {h.text && <small className="muted">Post: {h.text.slice(0, 120)}</small>}
+                  <small className="muted">Description: {(h.description || '').slice(0, 80)}</small>
+                  {!h.ok && <small className="err">{h.message}</small>}
+                </div>
+                <div className="acts">
+                  {!h.dryRun && h.ok && (
+                    <button className="mini" onClick={() => window.api.openSite(h.platform)}>Open {h.platform}</button>
+                  )}
+                  <button className="mini del" onClick={() => deleteHistory(h.id)}>Remove</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {tab === 'login' && (
+          <div className="card">
+            <h2>Login</h2>
+            <p className="sub">Connect only the accounts you need.</p>
+            <button className="go" style={{ marginTop: 0 }} onClick={() => window.api.loginAll()}>
+              Log in to all accounts (one by one)
+            </button>
+            {loginMsg && <div className="login-msg">{loginMsg}</div>}
+            <small className="muted" style={{ display: 'block', margin: '18px 0 8px' }}>Or log in individually:</small>
+            <div className="plats">
+              {NAMES.map((p) => (
+                <div key={p} className="plat" onClick={() => window.api.openSite(p)}><Dot p={p} />{p}</div>
+              ))}
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}

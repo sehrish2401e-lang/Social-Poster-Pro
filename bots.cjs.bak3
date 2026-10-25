@@ -1,0 +1,25 @@
+const { makeWindow, sleep } = require('./util.cjs');
+
+async function postToWhatsApp(caption, filePath) {
+  const win = makeWindow('whatsapp');
+  
+  // 1. Direct Web WhatsApp Load Karein
+  await win.loadURL('https://web.whatsapp.com');
+  await sleep(4000);
+
+  // 2. Electron window ke andar direct channel URL redirect karein
+  await win.loadURL('https://web.whatsapp.com/accept?code=0029VbDorTg2f3ED1P0rjy2H');
+  
+  return { ok: true, message: 'WhatsApp Channel Active in Electron' };
+}
+
+async function postAll(caption, filePath, platforms) {
+  const results = [];
+  if (platforms.includes('whatsapp')) {
+    const res = await postToWhatsApp(caption, filePath);
+    results.push({ platform: 'whatsapp', ...res });
+  }
+  return results;
+}
+
+module.exports = { postAll };

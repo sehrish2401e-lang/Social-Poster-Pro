@@ -1,0 +1,73 @@
+const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const path = require('path');
+const { makeWindow } = require('./util.cjs');
+const { postAll } = require('./bots.cjs');
+
+const SITES = {
+  facebook: 'https://www.facebook.com',
+  instagram: 'https://www.instagram.com',
+  tiktok: 'https://www.tiktok.com/login',
+  whatsapp: 'https://web.whatsapp.com',
+  youtube: 'https://studio.youtube.com',
+};
+const ORDER = ['facebook', 'instagram', 'tiktok', 'whatsapp', 'youtube'];
+
+let mainWin;
+function createWindow() {
+  mainWin = new BrowserWindow({
+    width: 1100,
+    height: 750,
+    webPreferences: { preload: path.join(__dirname, 'preload.cjs') },
+  });
+  mainWin.loadURL('http://localhost:5173');
+}
+app.whenReady().then(createWindow);
+app.on('window-all-closed', () => app.quit());
+
+function openLogin(name) {
+  return new Promise((resolve) => {
+    // YouTube / Google login ke liye external Chrome browser use karein
+    if (name === 'youtube') {
+      shell.openExternal(SITES.youtube);
+      resolve();
+      return;
+    }
+
+    const win = makeWindow(name);
+    win.removeMenu();
+    win.on('closed', resolve);
+    win.loadURL(SITES[name]).catch((err) => {
+      console.error(`${name} load error:`, err);
+      resolve();
+    });
+  });
+}
+
+ipcMain.handle('open-site', async (e, name) => {
+  if (SITES[name]) await openLogin(name);
+});
+
+ipcMain.handle('login-all', async () => {
+  for (let i = 0; i < ORDER.length; i++) {
+    const name = ORDER[i];
+    mainWin.webContents.send('login-step', `${i + 1}/${ORDER.length}: ${name} mein login karein, phir ye window band kar dein`);
+    await openLogin(name);
+  }
+  mainWin.webContents.send('login-step', 'Sab login ho gaye. Ab Post kar sakte hain.');
+  return true;
+});
+
+ipcMain.handle('pick-file', async () => {
+  const r = await dialog.showOpenDialog({
+    properties: ['openFile'],
+    filters: [{ name: 'Photo/Video', extensions: ['jpg', 'jpeg', 'png', 'mp4', 'mov'] }],
+  });
+  return r.canceled ? null : r.filePaths[0];
+});
+
+ipcMain.handle('post-all', async (e, data) => {
+  if (data.dryRun) return { results: data.platforms.map((p) => ({ ok: true, message: p + ': TEST MODE - asli post nahi hui' })) };
+  const caption = [data.text, data.description].filter(Boolean).join('\n\n');
+  const results = await postAll(caption, data.file, data.platforms);
+  return { results };
+});

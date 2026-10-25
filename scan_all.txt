@@ -1,0 +1,1414 @@
+﻿===== package.json =====
+{
+  "name": "social-poster",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
+    "build": "vite build",
+    "lint": "oxlint",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "ffmpeg-static": "^5.3.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "concurrently": "^10.0.5",
+    "electron": "^44.7.0",
+    "oxlint": "^1.81.0",
+    "vite": "^8.3.0",
+    "wait-on": "^9.5.1"
+  },
+  "main": "electron/main.cjs"
+}
+
+===== electron\bots.cjs =====
+const { postToFacebook } = require('./facebook.cjs');
+const { postToInstagram } = require('./instagram.cjs');
+const { postToTikTok } = require('./tiktok.cjs');
+const { postToYouTube } = require('./youtube.cjs');
+
+const fail = (m) => ({ ok: false, message: m });
+
+async function postAll(text, file, platforms) {
+  const results = [];
+  for (const p of platforms) {
+    try {
+      if (p === 'facebook') results.push(await postToFacebook(text, file));
+      else if (p === 'instagram') results.push(await postToInstagram(text, file));
+      else if (p === 'tiktok') results.push(await postToTikTok(text, file));
+      else if (p === 'youtube') results.push(await postToYouTube(text, file));
+      else results.push(fail(p + ': abhi post support nahi (sirf login hota hai)'));
+    } catch (e) {
+      results.push(fail(p + ': error - ' + e.message));
+    }
+  }
+  return results;
+}
+
+module.exports = { postAll };
+
+
+===== electron\bots.cjs.bak2] =====
+const { postToFacebook } = require('./facebook.cjs');
+const { postToInstagram } = require('./instagram.cjs');
+const { postToTikTok } = require('./tiktok.cjs');
+const { postToYouTube } = require('./youtube.cjs');
+
+const fail = (m) => ({ ok: false, message: m });
+
+async function postAll(text, file, platforms) {
+  const results = [];
+  for (const p of platforms) {
+    try {
+      if (p === 'facebook') results.push(await postToFacebook(text));
+      else if (p === 'instagram') results.push(await postToInstagram(text, file));
+      else if (p === 'tiktok') results.push(await postToTikTok(text, file));
+      else if (p === 'youtube') results.push(await postToYouTube(text, file));
+      else results.push(fail(p + ': abhi post support nahi (sirf login hota hai)'));
+    } catch (e) {
+      results.push(fail(p + ': error - ' + e.message));
+    }
+  }
+  return results;
+}
+
+module.exports = { postAll };
+
+===== electron\facebook.cjs =====
+const { BrowserWindow } = require('electron');
+const fs = require('fs');
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const DIR = 'C:\\SocialPosterData';
+
+async function shot(win, name) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const img = await win.webContents.capturePage();
+    fs.writeFileSync(DIR + '\\' + name + '.png', img.toPNG());
+  } catch (e) {}
+}
+
+async function attachFile(win, file) {
+  const pos = await js(win, `(function(){const b=document.querySelector("div[role=dialog] div[aria-label*=Photo]");if(!b)return null;const r=b.getBoundingClientRect();return {x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)};})();`);
+  if (pos) { await realClick(win, pos.x, pos.y); await sleep(2500); }
+  const dbg = win.webContents.debugger;
+  try { dbg.attach("1.3"); } catch (e) {}
+  try {
+    const doc = await dbg.sendCommand("DOM.getDocument", { depth: -1 });
+    let q = await dbg.sendCommand("DOM.querySelector", { nodeId: doc.root.nodeId, selector: `input[type="file"]` });
+    if (!q.nodeId) q = await dbg.sendCommand("DOM.querySelector", { nodeId: doc.root.nodeId, selector: `input[type="file"]` });
+    if (q.nodeId) await dbg.sendCommand("DOM.setFileInputFiles", { files: [file], nodeId: q.nodeId });
+  } catch (e) {}
+  try { dbg.detach(); } catch (e) {}
+  await sleep(8000);
+  await shot(win, "fb-3b-attached");
+}
+function js(win, code) {
+  return win.webContents.executeJavaScript(code);
+}
+
+async function realClick(win, x, y) {
+  const wc = win.webContents;
+  wc.sendInputEvent({ type: 'mouseMove', x, y });
+  await sleep(200);
+  wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+  wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+}
+
+async function postToFacebook(text, file) {
+  const win = new BrowserWindow({
+    width: 1400, height: 950, show: true,
+    webPreferences: { partition: 'persist:facebook' },
+  });
+  win.webContents.setUserAgent(
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + process.versions.chrome.split('.')[0] + '.0.0.0 Safari/537.36'
+  );
+  try {
+    await win.loadURL('https://www.facebook.com/');
+    await sleep(8000);
+
+    // box ki asli position (sab se chhota element jis mein "on your mind" likha ho)
+    const pos = await js(win, `
+      (function () {
+        const all = [...document.querySelectorAll('div[role="button"], span')];
+        const m = all.filter(e => /on your mind/i.test((e.innerText || '').trim()) && (e.innerText || '').length < 100);
+        if (!m.length) return null;
+        const el = m[m.length - 1];
+        el.scrollIntoView({ block: 'center' });
+        const r = el.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    await sleep(800);
+    await shot(win, 'fb-1-home');
+    if (!pos) return { ok: false, message: 'Facebook: post box nahi mila (fb-1-home.png dekhein)' };
+
+    const pos2 = await js(win, `
+      (function () {
+        const all = [...document.querySelectorAll('div[role="button"], span')];
+        const m = all.filter(e => /on your mind/i.test((e.innerText || '').trim()) && (e.innerText || '').length < 100);
+        const el = m[m.length - 1];
+        const r = el.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    await realClick(win, pos2.x, pos2.y);
+
+    // dialog ka intezar
+    let dlg = false;
+    for (let i = 0; i < 12; i++) {
+      await sleep(1000);
+      dlg = await js(win, `!!document.querySelector('div[contenteditable="true"][role="textbox"]')`).catch(() => false);
+      if (dlg) break;
+    }
+    await shot(win, 'fb-2-dialog');
+    if (!dlg) return { ok: false, message: 'Facebook: click ke baad bhi dialog nahi khuli (fb-2-dialog.png dekhein)' };
+
+    await js(win, `document.querySelector('div[contenteditable="true"][role="textbox"]').focus(); true;`);
+    await sleep(500);
+    await win.webContents.insertText(text || '');
+    if (file) await attachFile(win, file);
+    await sleep(3000);
+    await shot(win, 'fb-3-typed');
+
+    const btnPos = await js(win, `
+      (function () {
+        const b = document.querySelector('div[aria-label="Post"][role="button"]');
+        if (!b) return 'nobutton';
+        if (b.getAttribute('aria-disabled') === 'true') return 'disabled';
+        const r = b.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    if (typeof btnPos === 'string') return { ok: false, message: 'Facebook: Post button ' + btnPos + ' (fb-3-typed.png dekhein)' };
+    await realClick(win, btnPos.x, btnPos.y);
+    await sleep(3000);
+    // "Add WhatsApp button" jaisa popup aaye to "Not now" dabao, phir Post dobara
+    const notNow = await js(win, `
+      (function () {
+        const b = [...document.querySelectorAll('div[role="button"], button')]
+          .find(e => /^not now$/i.test((e.innerText || '').trim()));
+        if (!b) return null;
+        const r = b.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    if (notNow) {
+      await realClick(win, notNow.x, notNow.y);
+      await sleep(2000);
+      const again = await js(win, `
+        (function () {
+          const b = document.querySelector('div[aria-label="Post"][role="button"]');
+          if (!b || b.getAttribute('aria-disabled') === 'true') return null;
+          const r = b.getBoundingClientRect();
+          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        })();
+      `);
+      if (again) await realClick(win, again.x, again.y);
+    }
+    await sleep(8000);
+    await shot(win, 'fb-4-after');
+
+    const still = await js(win, `!!document.querySelector('div[contenteditable="true"][role="textbox"]')`).catch(() => true);
+    if (still) return { ok: false, message: 'Facebook: Post dabaya lekin dialog band nahi hui (fb-4-after.png dekhein)' };
+    return { ok: true, message: 'Facebook: dialog band hui, profile pe check karein' };
+  } finally {
+    await sleep(5000);
+    win.close();
+  }
+}
+
+module.exports = { postToFacebook };
+
+
+
+
+
+
+===== electron\facebook.cjs.bak2 =====
+const { BrowserWindow } = require('electron');
+const fs = require('fs');
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const DIR = 'C:\\SocialPosterData';
+
+async function shot(win, name) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const img = await win.webContents.capturePage();
+    fs.writeFileSync(DIR + '\\' + name + '.png', img.toPNG());
+  } catch (e) {}
+}
+
+function js(win, code) {
+  return win.webContents.executeJavaScript(code);
+}
+
+async function realClick(win, x, y) {
+  const wc = win.webContents;
+  wc.sendInputEvent({ type: 'mouseMove', x, y });
+  await sleep(200);
+  wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+  wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+}
+
+async function postToFacebook(text) {
+  const win = new BrowserWindow({
+    width: 1100, height: 800, show: true,
+    webPreferences: { partition: 'persist:facebook' },
+  });
+  win.webContents.setUserAgent(
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + process.versions.chrome.split('.')[0] + '.0.0.0 Safari/537.36'
+  );
+  try {
+    await win.loadURL('https://www.facebook.com/');
+    await sleep(8000);
+
+    // box ki asli position (sab se chhota element jis mein "on your mind" likha ho)
+    const pos = await js(win, `
+      (function () {
+        const all = [...document.querySelectorAll('div[role="button"], span')];
+        const m = all.filter(e => /on your mind/i.test((e.innerText || '').trim()) && (e.innerText || '').length < 60);
+        if (!m.length) return null;
+        const el = m[m.length - 1];
+        el.scrollIntoView({ block: 'center' });
+        const r = el.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    await sleep(800);
+    await shot(win, 'fb-1-home');
+    if (!pos) return { ok: false, message: 'Facebook: post box nahi mila (fb-1-home.png dekhein)' };
+
+    const pos2 = await js(win, `
+      (function () {
+        const all = [...document.querySelectorAll('div[role="button"], span')];
+        const m = all.filter(e => /on your mind/i.test((e.innerText || '').trim()) && (e.innerText || '').length < 60);
+        const el = m[m.length - 1];
+        const r = el.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    await realClick(win, pos2.x, pos2.y);
+
+    // dialog ka intezar
+    let dlg = false;
+    for (let i = 0; i < 12; i++) {
+      await sleep(1000);
+      dlg = await js(win, `!!document.querySelector('div[role="dialog"] div[contenteditable="true"]')`).catch(() => false);
+      if (dlg) break;
+    }
+    await shot(win, 'fb-2-dialog');
+    if (!dlg) return { ok: false, message: 'Facebook: click ke baad bhi dialog nahi khuli (fb-2-dialog.png dekhein)' };
+
+    await js(win, `document.querySelector('div[role="dialog"] div[contenteditable="true"]').focus(); true;`);
+    await sleep(500);
+    await win.webContents.insertText(text || '');
+    await sleep(3000);
+    await shot(win, 'fb-3-typed');
+
+    const btnPos = await js(win, `
+      (function () {
+        const b = document.querySelector('div[role="dialog"] div[aria-label="Post"]');
+        if (!b) return 'nobutton';
+        if (b.getAttribute('aria-disabled') === 'true') return 'disabled';
+        const r = b.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    if (typeof btnPos === 'string') return { ok: false, message: 'Facebook: Post button ' + btnPos + ' (fb-3-typed.png dekhein)' };
+    await realClick(win, btnPos.x, btnPos.y);
+    await sleep(3000);
+    // "Add WhatsApp button" jaisa popup aaye to "Not now" dabao, phir Post dobara
+    const notNow = await js(win, `
+      (function () {
+        const b = [...document.querySelectorAll('div[role="button"], button')]
+          .find(e => /^not now$/i.test((e.innerText || '').trim()));
+        if (!b) return null;
+        const r = b.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    if (notNow) {
+      await realClick(win, notNow.x, notNow.y);
+      await sleep(2000);
+      const again = await js(win, `
+        (function () {
+          const b = document.querySelector('div[role="dialog"] div[aria-label="Post"]');
+          if (!b || b.getAttribute('aria-disabled') === 'true') return null;
+          const r = b.getBoundingClientRect();
+          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        })();
+      `);
+      if (again) await realClick(win, again.x, again.y);
+    }
+    await sleep(8000);
+    await shot(win, 'fb-4-after');
+
+    const still = await js(win, `!!document.querySelector('div[role="dialog"] div[contenteditable="true"]')`).catch(() => true);
+    if (still) return { ok: false, message: 'Facebook: Post dabaya lekin dialog band nahi hui (fb-4-after.png dekhein)' };
+    return { ok: true, message: 'Facebook: dialog band hui, profile pe check karein' };
+  } finally {
+    await sleep(5000);
+    win.close();
+  }
+}
+
+module.exports = { postToFacebook };
+
+
+
+===== electron\facebook.cjs.bak3 =====
+const { BrowserWindow } = require('electron');
+const fs = require('fs');
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const DIR = 'C:\\SocialPosterData';
+
+async function shot(win, name) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const img = await win.webContents.capturePage();
+    fs.writeFileSync(DIR + '\\' + name + '.png', img.toPNG());
+  } catch (e) {}
+}
+
+async function attachFile(win, file) {
+  const pos = await js(win, `(function(){const b=document.querySelector("div[role=dialog] div[aria-label*=Photo]");if(!b)return null;const r=b.getBoundingClientRect();return {x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)};})();`);
+  if (pos) { await realClick(win, pos.x, pos.y); await sleep(2500); }
+  const dbg = win.webContents.debugger;
+  try { dbg.attach("1.3"); } catch (e) {}
+  try {
+    const doc = await dbg.sendCommand("DOM.getDocument", { depth: -1 });
+    let q = await dbg.sendCommand("DOM.querySelector", { nodeId: doc.root.nodeId, selector: `div[role="dialog"] input[type="file"]` });
+    if (!q.nodeId) q = await dbg.sendCommand("DOM.querySelector", { nodeId: doc.root.nodeId, selector: `input[type="file"]` });
+    if (q.nodeId) await dbg.sendCommand("DOM.setFileInputFiles", { files: [file], nodeId: q.nodeId });
+  } catch (e) {}
+  try { dbg.detach(); } catch (e) {}
+  await sleep(8000);
+  await shot(win, "fb-3b-attached");
+}
+function js(win, code) {
+  return win.webContents.executeJavaScript(code);
+}
+
+async function realClick(win, x, y) {
+  const wc = win.webContents;
+  wc.sendInputEvent({ type: 'mouseMove', x, y });
+  await sleep(200);
+  wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+  wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+}
+
+async function postToFacebook(text, file) {
+  const win = new BrowserWindow({
+    width: 1100, height: 800, show: true,
+    webPreferences: { partition: 'persist:facebook' },
+  });
+  win.webContents.setUserAgent(
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + process.versions.chrome.split('.')[0] + '.0.0.0 Safari/537.36'
+  );
+  try {
+    await win.loadURL('https://www.facebook.com/');
+    await sleep(8000);
+
+    // box ki asli position (sab se chhota element jis mein "on your mind" likha ho)
+    const pos = await js(win, `
+      (function () {
+        const all = [...document.querySelectorAll('div[role="button"], span')];
+        const m = all.filter(e => /on your mind/i.test((e.innerText || '').trim()) && (e.innerText || '').length < 60);
+        if (!m.length) return null;
+        const el = m[m.length - 1];
+        el.scrollIntoView({ block: 'center' });
+        const r = el.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    await sleep(800);
+    await shot(win, 'fb-1-home');
+    if (!pos) return { ok: false, message: 'Facebook: post box nahi mila (fb-1-home.png dekhein)' };
+
+    const pos2 = await js(win, `
+      (function () {
+        const all = [...document.querySelectorAll('div[role="button"], span')];
+        const m = all.filter(e => /on your mind/i.test((e.innerText || '').trim()) && (e.innerText || '').length < 60);
+        const el = m[m.length - 1];
+        const r = el.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    await realClick(win, pos2.x, pos2.y);
+
+    // dialog ka intezar
+    let dlg = false;
+    for (let i = 0; i < 12; i++) {
+      await sleep(1000);
+      dlg = await js(win, `!!document.querySelector('div[role="dialog"] div[contenteditable="true"]')`).catch(() => false);
+      if (dlg) break;
+    }
+    await shot(win, 'fb-2-dialog');
+    if (!dlg) return { ok: false, message: 'Facebook: click ke baad bhi dialog nahi khuli (fb-2-dialog.png dekhein)' };
+
+    await js(win, `document.querySelector('div[role="dialog"] div[contenteditable="true"]').focus(); true;`);
+    await sleep(500);
+    await win.webContents.insertText(text || '');
+    if (file) await attachFile(win, file);
+    await sleep(3000);
+    await shot(win, 'fb-3-typed');
+
+    const btnPos = await js(win, `
+      (function () {
+        const b = document.querySelector('div[role="dialog"] div[aria-label="Post"]');
+        if (!b) return 'nobutton';
+        if (b.getAttribute('aria-disabled') === 'true') return 'disabled';
+        const r = b.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    if (typeof btnPos === 'string') return { ok: false, message: 'Facebook: Post button ' + btnPos + ' (fb-3-typed.png dekhein)' };
+    await realClick(win, btnPos.x, btnPos.y);
+    await sleep(3000);
+    // "Add WhatsApp button" jaisa popup aaye to "Not now" dabao, phir Post dobara
+    const notNow = await js(win, `
+      (function () {
+        const b = [...document.querySelectorAll('div[role="button"], button')]
+          .find(e => /^not now$/i.test((e.innerText || '').trim()));
+        if (!b) return null;
+        const r = b.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    if (notNow) {
+      await realClick(win, notNow.x, notNow.y);
+      await sleep(2000);
+      const again = await js(win, `
+        (function () {
+          const b = document.querySelector('div[role="dialog"] div[aria-label="Post"]');
+          if (!b || b.getAttribute('aria-disabled') === 'true') return null;
+          const r = b.getBoundingClientRect();
+          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        })();
+      `);
+      if (again) await realClick(win, again.x, again.y);
+    }
+    await sleep(8000);
+    await shot(win, 'fb-4-after');
+
+    const still = await js(win, `!!document.querySelector('div[role="dialog"] div[contenteditable="true"]')`).catch(() => true);
+    if (still) return { ok: false, message: 'Facebook: Post dabaya lekin dialog band nahi hui (fb-4-after.png dekhein)' };
+    return { ok: true, message: 'Facebook: dialog band hui, profile pe check karein' };
+  } finally {
+    await sleep(5000);
+    win.close();
+  }
+}
+
+module.exports = { postToFacebook };
+
+
+
+
+===== electron\facebook.cjs.bak4 =====
+const { BrowserWindow } = require('electron');
+const fs = require('fs');
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const DIR = 'C:\\SocialPosterData';
+
+async function shot(win, name) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const img = await win.webContents.capturePage();
+    fs.writeFileSync(DIR + '\\' + name + '.png', img.toPNG());
+  } catch (e) {}
+}
+
+async function attachFile(win, file) {
+  const pos = await js(win, `(function(){const b=document.querySelector("div[role=dialog] div[aria-label*=Photo]");if(!b)return null;const r=b.getBoundingClientRect();return {x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)};})();`);
+  if (pos) { await realClick(win, pos.x, pos.y); await sleep(2500); }
+  const dbg = win.webContents.debugger;
+  try { dbg.attach("1.3"); } catch (e) {}
+  try {
+    const doc = await dbg.sendCommand("DOM.getDocument", { depth: -1 });
+    let q = await dbg.sendCommand("DOM.querySelector", { nodeId: doc.root.nodeId, selector: `div[role="dialog"] input[type="file"]` });
+    if (!q.nodeId) q = await dbg.sendCommand("DOM.querySelector", { nodeId: doc.root.nodeId, selector: `input[type="file"]` });
+    if (q.nodeId) await dbg.sendCommand("DOM.setFileInputFiles", { files: [file], nodeId: q.nodeId });
+  } catch (e) {}
+  try { dbg.detach(); } catch (e) {}
+  await sleep(8000);
+  await shot(win, "fb-3b-attached");
+}
+function js(win, code) {
+  return win.webContents.executeJavaScript(code);
+}
+
+async function realClick(win, x, y) {
+  const wc = win.webContents;
+  wc.sendInputEvent({ type: 'mouseMove', x, y });
+  await sleep(200);
+  wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+  wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+}
+
+async function postToFacebook(text, file) {
+  const win = new BrowserWindow({
+    width: 1100, height: 800, show: true,
+    webPreferences: { partition: 'persist:facebook' },
+  });
+  win.webContents.setUserAgent(
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + process.versions.chrome.split('.')[0] + '.0.0.0 Safari/537.36'
+  );
+  try {
+    await win.loadURL('https://www.facebook.com/');
+    await sleep(8000);
+
+    // box ki asli position (sab se chhota element jis mein "on your mind" likha ho)
+    const pos = await js(win, `
+      (function () {
+        const all = [...document.querySelectorAll('div[role="button"], span')];
+        const m = all.filter(e => /on your mind/i.test((e.innerText || '').trim()) && (e.innerText || '').length < 100);
+        if (!m.length) return null;
+        const el = m[m.length - 1];
+        el.scrollIntoView({ block: 'center' });
+        const r = el.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    await sleep(800);
+    await shot(win, 'fb-1-home');
+    if (!pos) return { ok: false, message: 'Facebook: post box nahi mila (fb-1-home.png dekhein)' };
+
+    const pos2 = await js(win, `
+      (function () {
+        const all = [...document.querySelectorAll('div[role="button"], span')];
+        const m = all.filter(e => /on your mind/i.test((e.innerText || '').trim()) && (e.innerText || '').length < 100);
+        const el = m[m.length - 1];
+        const r = el.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    await realClick(win, pos2.x, pos2.y);
+
+    // dialog ka intezar
+    let dlg = false;
+    for (let i = 0; i < 12; i++) {
+      await sleep(1000);
+      dlg = await js(win, `!!document.querySelector('div[role="dialog"] div[contenteditable="true"]')`).catch(() => false);
+      if (dlg) break;
+    }
+    await shot(win, 'fb-2-dialog');
+    if (!dlg) return { ok: false, message: 'Facebook: click ke baad bhi dialog nahi khuli (fb-2-dialog.png dekhein)' };
+
+    await js(win, `document.querySelector('div[role="dialog"] div[contenteditable="true"]').focus(); true;`);
+    await sleep(500);
+    await win.webContents.insertText(text || '');
+    if (file) await attachFile(win, file);
+    await sleep(3000);
+    await shot(win, 'fb-3-typed');
+
+    const btnPos = await js(win, `
+      (function () {
+        const b = document.querySelector('div[role="dialog"] div[aria-label="Post"]');
+        if (!b) return 'nobutton';
+        if (b.getAttribute('aria-disabled') === 'true') return 'disabled';
+        const r = b.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    if (typeof btnPos === 'string') return { ok: false, message: 'Facebook: Post button ' + btnPos + ' (fb-3-typed.png dekhein)' };
+    await realClick(win, btnPos.x, btnPos.y);
+    await sleep(3000);
+    // "Add WhatsApp button" jaisa popup aaye to "Not now" dabao, phir Post dobara
+    const notNow = await js(win, `
+      (function () {
+        const b = [...document.querySelectorAll('div[role="button"], button')]
+          .find(e => /^not now$/i.test((e.innerText || '').trim()));
+        if (!b) return null;
+        const r = b.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      })();
+    `);
+    if (notNow) {
+      await realClick(win, notNow.x, notNow.y);
+      await sleep(2000);
+      const again = await js(win, `
+        (function () {
+          const b = document.querySelector('div[role="dialog"] div[aria-label="Post"]');
+          if (!b || b.getAttribute('aria-disabled') === 'true') return null;
+          const r = b.getBoundingClientRect();
+          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        })();
+      `);
+      if (again) await realClick(win, again.x, again.y);
+    }
+    await sleep(8000);
+    await shot(win, 'fb-4-after');
+
+    const still = await js(win, `!!document.querySelector('div[role="dialog"] div[contenteditable="true"]')`).catch(() => true);
+    if (still) return { ok: false, message: 'Facebook: Post dabaya lekin dialog band nahi hui (fb-4-after.png dekhein)' };
+    return { ok: true, message: 'Facebook: dialog band hui, profile pe check karein' };
+  } finally {
+    await sleep(5000);
+    win.close();
+  }
+}
+
+module.exports = { postToFacebook };
+
+
+
+
+
+===== electron\instagram.cjs =====
+const { sleep, makeWindow, waitFor, clickText, setFile, ensureLogin } = require('./util.cjs');
+
+async function postToInstagram(text, file) {
+  if (!file) return { ok: false, message: 'Instagram: pehle photo/video choose karein' };
+  const win = makeWindow('instagram');
+  try {
+    await ensureLogin(win, 'https://www.instagram.com/');
+
+    const created = await win.webContents.executeJavaScript(`
+      (function () {
+        const svg = document.querySelector('svg[aria-label="New post"]');
+        if (!svg) return false;
+        (svg.closest('a, div[role="button"], div[role="link"]') || svg).click();
+        return true;
+      })();
+    `);
+    if (!created) return { ok: false, message: 'Instagram: Create (New post) button nahi mila' };
+    await sleep(2000);
+    await clickText(win, '^post$');
+    await sleep(2000);
+
+    if (!(await waitFor(win, `!!document.querySelector('input[type="file"]')`, 15000)))
+      return { ok: false, message: 'Instagram: file wala box nahi mila' };
+    const attached =
+      (await setFile(win, 'div[role="dialog"] input[type="file"]', file)) ||
+      (await setFile(win, 'input[type="file"]', file));
+    if (!attached) return { ok: false, message: 'Instagram: file attach nahi hui' };
+    await sleep(6000);
+    await clickText(win, '^ok$'); // "video ab reel ban jati hai" popup
+
+    if (!(await waitFor(win, `[...document.querySelectorAll('div[role="button"]')].some(e=>/^next$/i.test((e.innerText||'').trim()))`, 30000)))
+      return { ok: false, message: 'Instagram: Next button nahi mila' };
+    await clickText(win, '^next$');
+    await sleep(3000);
+    await clickText(win, '^next$');
+    await sleep(3000);
+
+    const captionOk = await waitFor(win, `
+      (function () {
+        const box = document.querySelector('div[aria-label*="aption"], div[role="dialog"] div[contenteditable="true"]');
+        if (!box) return false;
+        box.focus();
+        document.execCommand('insertText', false, ${JSON.stringify(text || '')});
+        return true;
+      })();
+    `, 20000);
+    if (!captionOk) return { ok: false, message: 'Instagram: caption box nahi mila' };
+    await sleep(2000);
+
+    if (!(await clickText(win, '^share$')))
+      return { ok: false, message: 'Instagram: Share button nahi mila' };
+
+    const done = await waitFor(win, `/has been shared|post shared|reel shared/i.test(document.body.innerText)`, 120000);
+    return done
+      ? { ok: true, message: 'Instagram: post ho gayi' }
+      : { ok: false, message: 'Instagram: Share dabaya lekin confirm nahi aaya, check karein' };
+  } finally {
+    await sleep(2000);
+    win.close();
+  }
+}
+
+module.exports = { postToInstagram };
+
+
+===== electron\instagram.cjs.bak2 =====
+const { sleep, makeWindow, waitFor, clickText, setFile, ensureLogin } = require('./util.cjs');
+
+async function postToInstagram(text, file) {
+  if (!file) return { ok: false, message: 'Instagram: pehle photo/video choose karein' };
+  const win = makeWindow('instagram');
+  try {
+    await ensureLogin(win, 'https://www.instagram.com/');
+
+    const created = await win.webContents.executeJavaScript(`
+      (function () {
+        const svg = document.querySelector('svg[aria-label="New post"]');
+        if (!svg) return false;
+        (svg.closest('a, div[role="button"], div[role="link"]') || svg).click();
+        return true;
+      })();
+    `);
+    if (!created) return { ok: false, message: 'Instagram: Create (New post) button nahi mila' };
+    await sleep(2000);
+    await clickText(win, '^post$');
+    await sleep(2000);
+
+    if (!(await waitFor(win, `!!document.querySelector('input[type="file"]')`, 15000)))
+      return { ok: false, message: 'Instagram: file wala box nahi mila' };
+    const attached =
+      (await setFile(win, 'div[role="dialog"] input[type="file"]', file)) ||
+      (await setFile(win, 'input[type="file"]', file));
+    if (!attached) return { ok: false, message: 'Instagram: file attach nahi hui' };
+    await sleep(6000);
+    await clickText(win, '^ok$'); // "video ab reel ban jati hai" popup
+
+    if (!(await waitFor(win, `[...document.querySelectorAll('div[role="button"]')].some(e=>/^next$/i.test((e.innerText||'').trim()))`, 30000)))
+      return { ok: false, message: 'Instagram: Next button nahi mila' };
+    await clickText(win, '^next$');
+    await sleep(3000);
+    await clickText(win, '^next$');
+    await sleep(3000);
+
+    const captionOk = await waitFor(win, `
+      (function () {
+        const box = document.querySelector('div[aria-label^="Write a caption"]');
+        if (!box) return false;
+        box.focus();
+        document.execCommand('insertText', false, ${JSON.stringify(text || '')});
+        return true;
+      })();
+    `, 20000);
+    if (!captionOk) return { ok: false, message: 'Instagram: caption box nahi mila' };
+    await sleep(2000);
+
+    if (!(await clickText(win, '^share$')))
+      return { ok: false, message: 'Instagram: Share button nahi mila' };
+
+    const done = await waitFor(win, `/has been shared|post shared|reel shared/i.test(document.body.innerText)`, 120000);
+    return done
+      ? { ok: true, message: 'Instagram: post ho gayi' }
+      : { ok: false, message: 'Instagram: Share dabaya lekin confirm nahi aaya, check karein' };
+  } finally {
+    await sleep(2000);
+    win.close();
+  }
+}
+
+module.exports = { postToInstagram };
+
+===== electron\main.cjs =====
+const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const path = require('path');
+const { makeWindow } = require('./util.cjs');
+const { postAll } = require('./bots.cjs');
+
+const SITES = {
+  facebook: 'https://www.facebook.com',
+  instagram: 'https://www.instagram.com',
+  tiktok: 'https://www.tiktok.com/login',
+  whatsapp: 'https://web.whatsapp.com',
+  youtube: 'https://studio.youtube.com',
+};
+const ORDER = ['facebook', 'instagram', 'tiktok', 'whatsapp', 'youtube'];
+
+let mainWin;
+function createWindow() {
+  mainWin = new BrowserWindow({
+    width: 1100,
+    height: 750,
+    webPreferences: { preload: path.join(__dirname, 'preload.cjs') },
+  });
+  mainWin.loadURL('http://localhost:5173');
+}
+app.whenReady().then(createWindow);
+app.on('window-all-closed', () => app.quit());
+
+// Login window app ke andar kholo, band hone tak intezar
+function openLogin(name) {
+  return new Promise((resolve) => {
+    const win = makeWindow(name);
+    win.removeMenu();
+    win.on('closed', resolve);
+    win.loadURL(SITES[name]).catch(() => {});
+  });
+}
+
+ipcMain.handle('open-site', async (e, name) => {
+  if (SITES[name]) await openLogin(name);
+});
+
+ipcMain.handle('login-all', async () => {
+  for (let i = 0; i < ORDER.length; i++) {
+    const name = ORDER[i];
+    mainWin.webContents.send('login-step', `${i + 1}/${ORDER.length}: ${name} mein login karein, phir ye window band kar dein`);
+    await openLogin(name);
+  }
+  mainWin.webContents.send('login-step', 'Sab login ho gaye. Ab Post kar sakte hain.');
+  return true;
+});
+
+ipcMain.handle('pick-file', async () => {
+  const r = await dialog.showOpenDialog({
+    properties: ['openFile'],
+    filters: [{ name: 'Photo/Video', extensions: ['jpg', 'jpeg', 'png', 'mp4', 'mov'] }],
+  });
+  return r.canceled ? null : r.filePaths[0];
+});
+
+ipcMain.handle('post-all', async (e, data) => {
+  if (data.dryRun) return { results: data.platforms.map((p) => ({ ok: true, message: p + ': TEST MODE - asli post nahi hui' })) };
+  const caption = [data.text, data.description].filter(Boolean).join('\n\n');
+  const results = await postAll(caption, data.file, data.platforms);
+  return { results };
+});
+
+
+
+===== electron\main.cjs.bak =====
+const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const path = require('path');
+const { makeWindow } = require('./util.cjs');
+const { postAll } = require('./bots.cjs');
+
+const SITES = {
+  facebook: 'https://www.facebook.com',
+  instagram: 'https://www.instagram.com',
+  tiktok: 'https://www.tiktok.com/login',
+  whatsapp: 'https://web.whatsapp.com',
+  youtube: 'https://studio.youtube.com',
+};
+const ORDER = ['facebook', 'instagram', 'tiktok', 'whatsapp', 'youtube'];
+
+let mainWin;
+function createWindow() {
+  mainWin = new BrowserWindow({
+    width: 1100,
+    height: 750,
+    webPreferences: { preload: path.join(__dirname, 'preload.cjs') },
+  });
+  mainWin.loadURL('http://localhost:5173');
+}
+app.whenReady().then(createWindow);
+app.on('window-all-closed', () => app.quit());
+
+// Login window app ke andar kholo, band hone tak intezar
+function openLogin(name) {
+  return new Promise((resolve) => {
+    const win = makeWindow(name);
+    win.removeMenu();
+    win.on('closed', resolve);
+    win.loadURL(SITES[name]).catch(() => {});
+  });
+}
+
+ipcMain.handle('open-site', async (e, name) => {
+  if (SITES[name]) await openLogin(name);
+});
+
+ipcMain.handle('login-all', async () => {
+  for (let i = 0; i < ORDER.length; i++) {
+    const name = ORDER[i];
+    mainWin.webContents.send('login-step', `${i + 1}/${ORDER.length}: ${name} mein login karein, phir ye window band kar dein`);
+    await openLogin(name);
+  }
+  mainWin.webContents.send('login-step', 'Sab login ho gaye. Ab Post kar sakte hain.');
+  return true;
+});
+
+ipcMain.handle('pick-file', async () => {
+  const r = await dialog.showOpenDialog({
+    properties: ['openFile'],
+    filters: [{ name: 'Photo/Video', extensions: ['jpg', 'jpeg', 'png', 'mp4', 'mov'] }],
+  });
+  return r.canceled ? null : r.filePaths[0];
+});
+
+ipcMain.handle('post-all', async (e, data) => {
+  const results = await postAll(data.text, data.file, data.platforms);
+  return { results };
+});
+
+===== electron\main.cjs.bak2 =====
+const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const path = require('path');
+const { makeWindow } = require('./util.cjs');
+const { postAll } = require('./bots.cjs');
+
+const SITES = {
+  facebook: 'https://www.facebook.com',
+  instagram: 'https://www.instagram.com',
+  tiktok: 'https://www.tiktok.com/login',
+  whatsapp: 'https://web.whatsapp.com',
+  youtube: 'https://studio.youtube.com',
+};
+const ORDER = ['facebook', 'instagram', 'tiktok', 'whatsapp', 'youtube'];
+
+let mainWin;
+function createWindow() {
+  mainWin = new BrowserWindow({
+    width: 1100,
+    height: 750,
+    webPreferences: { preload: path.join(__dirname, 'preload.cjs') },
+  });
+  mainWin.loadURL('http://localhost:5173');
+}
+app.whenReady().then(createWindow);
+app.on('window-all-closed', () => app.quit());
+
+// Login window app ke andar kholo, band hone tak intezar
+function openLogin(name) {
+  return new Promise((resolve) => {
+    const win = makeWindow(name);
+    win.removeMenu();
+    win.on('closed', resolve);
+    win.loadURL(SITES[name]).catch(() => {});
+  });
+}
+
+ipcMain.handle('open-site', async (e, name) => {
+  if (SITES[name]) await openLogin(name);
+});
+
+ipcMain.handle('login-all', async () => {
+  for (let i = 0; i < ORDER.length; i++) {
+    const name = ORDER[i];
+    mainWin.webContents.send('login-step', `${i + 1}/${ORDER.length}: ${name} mein login karein, phir ye window band kar dein`);
+    await openLogin(name);
+  }
+  mainWin.webContents.send('login-step', 'Sab login ho gaye. Ab Post kar sakte hain.');
+  return true;
+});
+
+ipcMain.handle('pick-file', async () => {
+  const r = await dialog.showOpenDialog({
+    properties: ['openFile'],
+    filters: [{ name: 'Photo/Video', extensions: ['jpg', 'jpeg', 'png', 'mp4', 'mov'] }],
+  });
+  return r.canceled ? null : r.filePaths[0];
+});
+
+ipcMain.handle('post-all', async (e, data) => {
+  if (data.dryRun) return { results: data.platforms.map((p) => ({ ok: true, message: p + ': TEST MODE - asli post nahi hui' })) };
+  const results = await postAll(data.text, data.file, data.platforms);
+  return { results };
+});
+
+
+===== electron\preload.cjs =====
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('api', {
+  postAll: (data) => ipcRenderer.invoke('post-all', data),
+  openSite: (name) => ipcRenderer.invoke('open-site', name),
+  pickFile: () => ipcRenderer.invoke('pick-file'),
+  loginAll: () => ipcRenderer.invoke('login-all'),
+  onLoginStep: (cb) => ipcRenderer.on('login-step', (_e, msg) => cb(msg)),
+});
+
+===== electron\site-preload.cjs =====
+try {
+  if (navigator.credentials) {
+    navigator.credentials.get = () => Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));
+    navigator.credentials.create = () => Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));
+  }
+  if (window.PublicKeyCredential) {
+    window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable = () => Promise.resolve(false);
+    window.PublicKeyCredential.isConditionalMediationAvailable = () => Promise.resolve(false);
+  }
+} catch (e) {}
+
+===== electron\tiktok.cjs =====
+const { sleep, makeWindow, waitFor, clickText, setFile, ensureLogin } = require('./util.cjs');
+
+async function postToTikTok(text, file) {
+  if (!file) return { ok: false, message: 'TikTok: photo ya video choose karein' };
+  const isImage = /\.(png|jpe?g|webp)$/i.test(file);
+  const win = makeWindow('tiktok');
+  win.webContents.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + process.versions.chrome.split('.')[0] + '.0.0.0 Safari/537.36');
+  try {
+    await ensureLogin(win, isImage ? 'https://www.tiktok.com/tiktokstudio/upload?tab=photo' : 'https://www.tiktok.com/tiktokstudio/upload');
+
+    if (!(await waitFor(win, `!!document.querySelector('input[type="file"]')`, 30000)))
+      return { ok: false, message: 'TikTok: upload box nahi mila' };
+    if (!(await setFile(win, 'input[type="file"]', file)))
+      return { ok: false, message: 'TikTok: file attach nahi hui' };
+
+    const BIGBOX = `(function(){ const els=[...document.querySelectorAll('.public-DraftEditor-content, div[contenteditable="true"]')].filter(e=>e.offsetParent!==null); if(!els.length) return null; els.sort((a,b)=>b.getBoundingClientRect().height-a.getBoundingClientRect().height); return els[0]; })()`;
+
+    const found = await waitFor(win, `
+      (function () {
+        const el = ${BIGBOX};
+        if (!el) return false;
+        el.scrollIntoView({ block: 'center' });
+        el.focus();
+        return true;
+      })();
+    `, 90000);
+    if (!found) return { ok: false, message: 'TikTok: caption box nahi mila' };
+    await sleep(3000);
+
+    const wc = win.webContents;
+    await wc.executeJavaScript(`(function(){ const el=${BIGBOX}; if(el){ el.focus(); document.execCommand('selectAll'); document.execCommand('delete'); } return true; })();`);
+    await sleep(500);
+
+    const lines = String(text || '').split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i]) await wc.insertText(lines[i]);
+      if (i < lines.length - 1) {
+        wc.sendInputEvent({ type: 'keyDown', keyCode: 'Enter' });
+        wc.sendInputEvent({ type: 'char', keyCode: 'Enter' });
+        wc.sendInputEvent({ type: 'keyUp', keyCode: 'Enter' });
+        await sleep(200);
+      }
+    }
+    await sleep(2000);
+
+    const clicked = await waitFor(win, `
+      (function () {
+        const b = [...document.querySelectorAll('button')].find(e =>
+          /^post$/i.test((e.innerText || '').trim()) &&
+          !e.disabled && e.getAttribute('aria-disabled') !== 'true' && e.getAttribute('data-disabled') !== 'true');
+        if (!b) return false;
+        b.click();
+        return true;
+      })();
+    `, 240000);
+    if (!clicked) return { ok: false, message: 'TikTok: Post button enable nahi hua' };
+
+    await sleep(3000);
+    await clickText(win, '^post now$');
+    const done = await waitFor(win, `/uploaded|manage your posts|video is being processed|posted|view post/i.test(document.body.innerText) || location.href.includes('/content')`, 60000);
+    return done
+      ? { ok: true, message: 'TikTok: post ho gayi' }
+      : { ok: false, message: 'TikTok: Post dabaya, Studio ke Posts me check karein' };
+  } finally {
+    await sleep(2000);
+    win.close();
+  }
+}
+
+module.exports = { postToTikTok };
+
+===== electron\tiktok.cjs.bak2 =====
+const { sleep, makeWindow, waitFor, clickText, setFile, ensureLogin } = require('./util.cjs');
+
+async function postToTikTok(text, file) {
+  if (!file || !/\.(mp4|mov|webm)$/i.test(file))
+    return { ok: false, message: 'TikTok: sirf video (mp4/mov) choose karein' };
+  const win = makeWindow('tiktok');
+  try {
+    await ensureLogin(win, 'https://www.tiktok.com/tiktokstudio/upload');
+
+    if (!(await waitFor(win, `!!document.querySelector('input[type="file"]')`, 30000)))
+      return { ok: false, message: 'TikTok: upload box nahi mila' };
+    if (!(await setFile(win, 'input[type="file"]', file)))
+      return { ok: false, message: 'TikTok: file attach nahi hui' };
+
+    const captionOk = await waitFor(win, `
+      (function () {
+        const box = document.querySelector('div[contenteditable="true"]');
+        if (!box) return false;
+        box.focus();
+        document.execCommand('selectAll');
+        document.execCommand('insertText', false, ${JSON.stringify(text || '')});
+        return true;
+      })();
+    `, 90000);
+    if (!captionOk) return { ok: false, message: 'TikTok: caption box nahi mila' };
+
+    // Video upload hone tak Post button disabled rehta hai, enabled hote hi click
+    const clicked = await waitFor(win, `
+      (function () {
+        const b = [...document.querySelectorAll('button')].find(e =>
+          /^post$/i.test((e.innerText || '').trim()) &&
+          !e.disabled && e.getAttribute('aria-disabled') !== 'true' && e.getAttribute('data-disabled') !== 'true');
+        if (!b) return false;
+        b.click();
+        return true;
+      })();
+    `, 240000);
+    if (!clicked) return { ok: false, message: 'TikTok: Post button enable nahi hua' };
+
+    await sleep(3000);
+    await clickText(win, '^post now$'); // "Continue to post?" popup
+    const done = await waitFor(win, `/uploaded|manage your posts|video is being processed/i.test(document.body.innerText)`, 60000);
+    return done
+      ? { ok: true, message: 'TikTok: post ho gayi' }
+      : { ok: false, message: 'TikTok: Post dabaya lekin confirm nahi aaya, check karein' };
+  } finally {
+    await sleep(2000);
+    win.close();
+  }
+}
+
+module.exports = { postToTikTok };
+
+===== electron\tiktok.cjs.bak3 =====
+const { sleep, makeWindow, waitFor, clickText, setFile, ensureLogin } = require('./util.cjs');
+
+const { execFileSync } = require('child_process');
+function imageToVideo(img) {
+  const ff = require('ffmpeg-static');
+  const out = 'C:\\SocialPosterData\\tiktok-photo.mp4';
+  require('fs').mkdirSync('C:\\SocialPosterData', { recursive: true });
+  execFileSync(ff, ['-y','-loop','1','-i',img,'-f','lavfi','-i','anullsrc=r=44100:cl=stereo','-t','6','-vf','scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p','-r','30','-c:v','libx264','-c:a','aac','-shortest',out]);
+  return out;
+}
+async function postToTikTok(text, file) {
+  if (file && /\.(png|jpe?g|webp)$/i.test(file)) file = imageToVideo(file); if (!file || !/\.(mp4|mov|webm)$/i.test(file))
+    return { ok: false, message: 'TikTok: sirf video (mp4/mov) choose karein' };
+  const win = makeWindow('tiktok');
+  try {
+    await ensureLogin(win, 'https://www.tiktok.com/tiktokstudio/upload');
+
+    if (!(await waitFor(win, `!!document.querySelector('input[type="file"]')`, 30000)))
+      return { ok: false, message: 'TikTok: upload box nahi mila' };
+    if (!(await setFile(win, 'input[type="file"]', file)))
+      return { ok: false, message: 'TikTok: file attach nahi hui' };
+
+    const captionOk = await waitFor(win, `
+      (function () {
+        const box = document.querySelector('div[contenteditable="true"]');
+        if (!box) return false;
+        box.focus();
+        document.execCommand('selectAll');
+        document.execCommand('insertText', false, ${JSON.stringify(text || '')});
+        return true;
+      })();
+    `, 90000);
+    if (!captionOk) return { ok: false, message: 'TikTok: caption box nahi mila' };
+
+    // Video upload hone tak Post button disabled rehta hai, enabled hote hi click
+    const clicked = await waitFor(win, `
+      (function () {
+        const b = [...document.querySelectorAll('button')].find(e =>
+          /^post$/i.test((e.innerText || '').trim()) &&
+          !e.disabled && e.getAttribute('aria-disabled') !== 'true' && e.getAttribute('data-disabled') !== 'true');
+        if (!b) return false;
+        b.click();
+        return true;
+      })();
+    `, 240000);
+    if (!clicked) return { ok: false, message: 'TikTok: Post button enable nahi hua' };
+
+    await sleep(3000);
+    await clickText(win, '^post now$'); // "Continue to post?" popup
+    const done = await waitFor(win, `/uploaded|manage your posts|video is being processed/i.test(document.body.innerText)`, 60000);
+    return done
+      ? { ok: true, message: 'TikTok: post ho gayi' }
+      : { ok: false, message: 'TikTok: Post dabaya lekin confirm nahi aaya, check karein' };
+  } finally {
+    await sleep(2000);
+    win.close();
+  }
+}
+
+module.exports = { postToTikTok };
+
+
+===== electron\tiktok.cjs.bak6 =====
+const { sleep, makeWindow, waitFor, clickText, setFile, ensureLogin } = require('./util.cjs');
+
+async function postToTikTok(text, file) {
+  if (!file)
+    return { ok: false, message: 'TikTok: sirf video (mp4/mov) choose karein' };
+  const win = makeWindow('tiktok');
+  win.webContents.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + process.versions.chrome.split('.')[0] + '.0.0.0 Safari/537.36');
+  try {
+    await ensureLogin(win, 'https://www.tiktok.com/tiktokstudio/upload?tab=photo');
+
+    if (!(await waitFor(win, `!!document.querySelector('input[type="file"]')`, 30000)))
+      return { ok: false, message: 'TikTok: upload box nahi mila' };
+    if (!(await setFile(win, 'input[type="file"]', file)))
+      return { ok: false, message: 'TikTok: file attach nahi hui' };
+
+    const captionOk = await waitFor(win, `
+      (function () {
+        const box = document.querySelector('div[contenteditable="true"]');
+        if (!box) return false;
+        box.focus();
+        document.execCommand('selectAll');
+        document.execCommand('insertText', false, ${JSON.stringify(text || '')});
+        return true;
+      })();
+    `, 90000);
+    if (!captionOk) return { ok: false, message: 'TikTok: caption box nahi mila' };
+
+    // Video upload hone tak Post button disabled rehta hai, enabled hote hi click
+    const clicked = await waitFor(win, `
+      (function () {
+        const b = [...document.querySelectorAll('button')].find(e =>
+          /^post$/i.test((e.innerText || '').trim()) &&
+          !e.disabled && e.getAttribute('aria-disabled') !== 'true' && e.getAttribute('data-disabled') !== 'true');
+        if (!b) return false;
+        b.click();
+        return true;
+      })();
+    `, 240000);
+    if (!clicked) return { ok: false, message: 'TikTok: Post button enable nahi hua' };
+
+    await sleep(3000);
+    await clickText(win, '^post now$'); // "Continue to post?" popup
+    const done = await waitFor(win, `/uploaded|manage your posts|video is being processed/i.test(document.body.innerText)`, 60000);
+    return done
+      ? { ok: true, message: 'TikTok: post ho gayi' }
+      : { ok: false, message: 'TikTok: Post dabaya lekin confirm nahi aaya, check karein' };
+  } finally {
+    await sleep(2000);
+    win.close();
+  }
+}
+
+module.exports = { postToTikTok };
+
+
+===== electron\util.cjs =====
+const { BrowserWindow } = require('electron');
+
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + process.versions.chrome.split('.')[0] + '.0.0.0 Safari/537.36';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function makeWindow(name) {
+  const win = new BrowserWindow({
+    width: 1100,
+    height: 780,
+    show: true,
+    webPreferences: { partition: 'persist:' + name },
+  });
+  win.webContents.setUserAgent(UA);
+  return win;
+}
+
+async function waitFor(win, js, ms = 30000) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    try {
+      if (await win.webContents.executeJavaScript(js)) return true;
+    } catch (e) {}
+    await sleep(1000);
+  }
+  return false;
+}
+
+function clickText(win, pattern, sel = 'div[role="button"], button, a') {
+  return win.webContents.executeJavaScript(`
+    (function () {
+      const re = new RegExp(${JSON.stringify(pattern)}, 'i');
+      const el = [...document.querySelectorAll(${JSON.stringify(sel)})]
+        .find(e => re.test((e.innerText || '').trim()));
+      if (!el) return false;
+      el.click();
+      return true;
+    })();
+  `);
+}
+
+async function setFile(win, selector, filePath) {
+  const dbg = win.webContents.debugger;
+  if (!dbg.isAttached()) dbg.attach('1.3');
+  const { root } = await dbg.sendCommand('DOM.getDocument', { depth: -1 });
+  const { nodeId } = await dbg.sendCommand('DOM.querySelector', {
+    nodeId: root.nodeId,
+    selector,
+  });
+  if (!nodeId) return false;
+  await dbg.sendCommand('DOM.setFileInputFiles', { nodeId, files: [filePath] });
+  return true;
+}
+
+// Login page ho to user ka 3 minute tak intezar (window band nahi hoti)
+async function ensureLogin(win, url) {
+  await win.loadURL(url);
+  await sleep(6000);
+  let waited = false;
+  for (let i = 0; i < 90; i++) {
+    const needs = await win.webContents
+      .executeJavaScript(`!!document.querySelector('input[type="password"]') || /\\/login/i.test(location.href)`)
+      .catch(() => true);
+    if (!needs) break;
+    waited = true;
+    await sleep(2000);
+  }
+  if (waited) {
+    await win.loadURL(url);
+    await sleep(6000);
+  }
+}
+
+module.exports = { UA, sleep, makeWindow, waitFor, clickText, setFile, ensureLogin };
+
+
+===== electron\youtube.cjs =====
+const { sleep, makeWindow, waitFor, clickText, setFile, ensureLogin } = require('./util.cjs');
+
+const run = (win, code) => win.webContents.executeJavaScript(code).catch(() => false);
+const clickSel = (win, sel) =>
+  run(win, `(function(){const e=document.querySelector(${JSON.stringify(sel)}); if(!e) return false; e.click(); return true;})()`);
+
+async function postToYouTube(text, file) {
+  if (!file || !/\.(mp4|mov|webm)$/i.test(file))
+    return { ok: false, message: 'YouTube: sirf video choose karein' };
+  const win = makeWindow('youtube');
+  try {
+    await ensureLogin(win, 'https://studio.youtube.com');
+    await sleep(3000);
+
+    if (!(await waitFor(win, `!!document.querySelector('#create-icon')`, 30000)))
+      return { ok: false, message: 'YouTube: Create button nahi mila (login check karein)' };
+    await clickSel(win, '#create-icon');
+    await sleep(1500);
+    await clickSel(win, '#text-item-0');
+
+    if (!(await waitFor(win, `!!document.querySelector('input[type="file"]')`, 30000)))
+      return { ok: false, message: 'YouTube: upload box nahi mila' };
+    if (!(await setFile(win, 'input[type="file"]', file)))
+      return { ok: false, message: 'YouTube: file attach nahi hui' };
+
+    const title = (text || 'Video').split('\n')[0].slice(0, 95);
+    const titleOk = await waitFor(win, `
+      (function () {
+        const box = document.querySelector('#title-textarea #textbox');
+        if (!box) return false;
+        box.focus();
+        document.execCommand('selectAll');
+        document.execCommand('insertText', false, ${JSON.stringify(title)});
+        return true;
+      })();
+    `, 90000);
+    if (!titleOk) return { ok: false, message: 'YouTube: title box nahi mila' };
+
+    if (text) {
+      await run(win, `
+        (function () {
+          const d = document.querySelector('#description-textarea #textbox');
+          if (!d) return false;
+          d.focus();
+          document.execCommand('insertText', false, ${JSON.stringify(text)});
+          return true;
+        })();
+      `);
+    }
+
+    await clickSel(win, '[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"]');
+    for (let i = 0; i < 3; i++) {
+      await sleep(1500);
+      await clickSel(win, '#next-button');
+    }
+    await sleep(1500);
+    await clickSel(win, '[name="PUBLIC"]');
+    await sleep(1500);
+    const done = await clickSel(win, '#done-button');
+    await sleep(10000);
+    return done
+      ? { ok: true, message: 'YouTube: upload ho gayi (Studio mein check kar lein)' }
+      : { ok: false, message: 'YouTube: Done button nahi mila, check karein' };
+  } finally {
+    await sleep(2000);
+    win.close();
+  }
+}
+
+module.exports = { postToYouTube };
