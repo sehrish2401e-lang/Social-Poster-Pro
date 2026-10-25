@@ -1,3 +1,6 @@
+if (!window.api) {
+  window.api = new Proxy({}, { get: () => () => Promise.resolve(null) });
+}
 import { useState, useEffect, useRef } from 'react';
 import './App.css';
 import MultiPost from './MultiPost.jsx';
