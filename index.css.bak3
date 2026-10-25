@@ -1,0 +1,13 @@
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+html, body, #root {
+  margin: 0; padding: 0; width: 100%; max-width: none; min-height: 100vh; display: block; text-align: left;
+}
+body {
+  font-family: 'Segoe UI', system-ui, Arial, sans-serif;
+  background: radial-gradient(circle at 15% 10%, #3a1c71 0%, transparent 45%),
+              radial-gradient(circle at 90% 20%, #0f5f8a 0%, transparent 40%),
+              #0d1020;
+  background-attachment: fixed;
+  color: #e9ecf5;
+}

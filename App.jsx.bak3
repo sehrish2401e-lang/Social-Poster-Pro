@@ -1,0 +1,432 @@
+import { useState, useEffect, useRef } from 'react';
+import './App.css';
+
+const NAMES = ['facebook', 'instagram', 'tiktok', 'youtube', 'whatsapp'];
+const NEED_FILE = ['instagram', 'tiktok', 'youtube'];
+const COLORS = {
+  facebook: '#1877f2', instagram: '#e1306c', tiktok: '#111111',
+  youtube: '#ff0000', whatsapp: '#25d366',
+};
+const TYPES = [['post', 'Post'], ['reel', 'Reel'], ['story', 'Story']];
+const H_KEY = 'sp_history';
+const S_KEY = 'sp_scheduled';
+
+const load = (k) => { try { return JSON.parse(localStorage.getItem(k)) || []; } catch { return []; } };
+const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* ignore */ } };
+const fmt = (iso) => new Date(iso).toLocaleString('en-GB', {
+  day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
+});
+const pad = (n) => String(n).padStart(2, '0');
+const toLocalInput = (d) =>
+  `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+const typeLabel = (t) => (TYPES.find((x) => x[0] === t) || [t, t])[1];
+
+const Dot = ({ p }) => (
+  <span className="dot" style={{ background: COLORS[p] }}>{p[0]}</span>
+);
+
+export default function App() {
+  const [tab, setTab] = useState('new');
+  const [postType, setPostType] = useState('post');
+  const [text, setText] = useState('');
+  const [description, setDescription] = useState('');
+  const [descs, setDescs] = useState({});
+  const [purpose, setPurpose] = useState('');
+  const [file, setFile] = useState(null);
+  const [platforms, setPlatforms] = useState({
+    facebook: false, instagram: false, tiktok: false, youtube: false, whatsapp: false,
+  });
+  const [mode, setMode] = useState('now');
+  const [whenStr, setWhenStr] = useState('');
+  const [testMode, setTestMode] = useState(true);
+  const [results, setResults] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [loginMsg, setLoginMsg] = useState('');
+  const [history, setHistory] = useState(() => load(H_KEY));
+  const [scheduled, setScheduled] = useState(() =>
+    load(S_KEY).map((j) =>
+      j.status === 'pending' && new Date(j.when).getTime() < Date.now() - 2 * 60 * 1000
+        ? { ...j, status: 'missed' } : j
+    )
+  );
+
+  const busyRef = useRef(false);
+  const schedRef = useRef(scheduled);
+  const runRef = useRef(null);
+  schedRef.current = scheduled;
+
+  useEffect(() => {
+    window.api.onLoginStep((m) => setLoginMsg(m));
+  }, []);
+
+  const updateScheduled = (fn) => setScheduled((prev) => {
+    const n = fn(prev);
+    save(S_KEY, n);
+    return n;
+  });
+
+  const addHistory = (entries) => setHistory((prev) => {
+    const n = [...entries, ...prev].slice(0, 500);
+    save(H_KEY, n);
+    return n;
+  });
+
+  const runJob = async (job) => {
+    busyRef.current = true;
+    setLoading(true);
+    setResults([{ loading: true, message: job.dryRun ? 'Test mode chal raha hai...' : 'Post ho rahi hai... app ki nayi window khulegi, kuch na dabayein' }]);
+    const out = [];
+    const entries = [];
+    for (const p of job.platforms) {
+      let rs;
+      try {
+        const res = await window.api.postAll({
+          text: job.text, description: job.descs[p], file: job.file,
+          platforms: [p], dryRun: job.dryRun, postType: job.postType,
+        });
+        rs = res && res.results && res.results.length ? res.results : [{ ok: false, message: 'Koi natija nahi mila' }];
+      } catch (e) {
+        rs = [{ ok: false, message: 'Error: ' + e.message }];
+      }
+      const ok = rs.every((x) => x.ok);
+      const message = rs.map((x) => x.message).join(' | ');
+      out.push({ ok, message: p + ': ' + message });
+      entries.push({
+        id: job.id + '-' + p, platform: p, postType: job.postType, purpose: job.purpose,
+        text: job.text, description: job.descs[p], ok, message,
+        postedAt: new Date().toISOString(), scheduledFor: job.when || null, dryRun: job.dryRun,
+      });
+    }
+    addHistory(entries);
+    setResults(out);
+    busyRef.current = false;
+    setLoading(false);
+  };
+  runRef.current = runJob;
+
+  // Har 10 second mein dekhta hai ke koi schedule hui post ka waqt aa gaya?
+  useEffect(() => {
+    const t = setInterval(() => {
+      if (busyRef.current) return;
+      const now = Date.now();
+      const due = schedRef.current.find((j) => j.status === 'pending' && new Date(j.when).getTime() <= now);
+      if (due) {
+        updateScheduled((prev) => prev.filter((j) => j.id !== due.id));
+        runRef.current(due);
+      }
+    }, 10000);
+    return () => clearInterval(t);
+  }, []);
+
+  const selected = Object.keys(platforms).filter((p) => platforms[p]);
+  const effDesc = (p) => (descs[p] && descs[p].trim()) || description;
+  const needFile = postType !== 'post' ? selected : NEED_FILE.filter((p) => selected.includes(p));
+  const missingFile = !file ? needFile : [];
+  const allDesc = selected.length > 0 && selected.every((p) => effDesc(p).trim().length > 0);
+  const whenOk = mode === 'now' || (whenStr && new Date(whenStr).getTime() > Date.now());
+  const canPost = !loading && selected.length > 0 && missingFile.length === 0 && allDesc
+    && (text.trim() || file) && whenOk;
+
+  const toggle = (name) => setPlatforms({ ...platforms, [name]: !platforms[name] });
+
+  const choose = async () => {
+    const f = await window.api.pickFile();
+    if (f) setFile(f);
+  };
+
+  const submit = () => {
+    const dMap = {};
+    selected.forEach((p) => { dMap[p] = effDesc(p); });
+    const job = {
+      id: 'j' + Date.now(), postType, text, file, platforms: selected, descs: dMap,
+      purpose: purpose.trim(), dryRun: testMode,
+      when: mode === 'later' ? new Date(whenStr).toISOString() : null,
+      status: 'pending',
+    };
+    if (mode === 'later') {
+      updateScheduled((prev) => [...prev, job].sort((a, b) => new Date(a.when) - new Date(b.when)));
+      setResults([{ ok: true, message: 'Schedule ho gayi: ' + fmt(job.when) + '. App khuli rakhein, warna post nahi jayegi.' }]);
+      setTab('scheduled');
+      return;
+    }
+    if (!testMode) {
+      const ok = window.confirm(
+        'Asli post hone wali hai!\n\nType: ' + typeLabel(postType) +
+        '\nKahan: ' + selected.join(', ') + '\n\nPakka post karni hai?'
+      );
+      if (!ok) return;
+    }
+    runJob(job);
+  };
+
+  const postMissedNow = (job) => {
+    if (busyRef.current) return;
+    updateScheduled((prev) => prev.filter((j) => j.id !== job.id));
+    setTab('new');
+    runJob(job);
+  };
+
+  const box = { marginTop: 16 };
+  const tabBtn = (id, label) => (
+    <button
+      key={id}
+      className="chip"
+      style={tab === id ? { background: '#0d9488', color: '#fff' } : {}}
+      onClick={() => setTab(id)}
+    >{label}</button>
+  );
+
+  return (
+    <div className="wrap">
+      <div className="header">
+        <div className="logo">SP</div>
+        <h1>Social Poster</h1>
+        <p>Ek post likho, sab jagah lagao</p>
+      </div>
+
+      <div className="chips" style={{ marginBottom: 16 }}>
+        {tabBtn('new', 'Nayi Post')}
+        {tabBtn('scheduled', 'Schedule hui (' + scheduled.length + ')')}
+        {tabBtn('history', 'History (' + history.length + ')')}
+      </div>
+
+      {tab === 'new' && (
+        <>
+          <div className="card">
+            <h3>1. Kya post karni hai</h3>
+            <div className="chips">
+              {TYPES.map(([id, label]) => (
+                <button
+                  key={id}
+                  className="chip"
+                  style={postType === id ? { background: '#0d9488', color: '#fff' } : {}}
+                  onClick={() => setPostType(id)}
+                >{label}</button>
+              ))}
+            </div>
+
+            <h3 style={box}>Post likho</h3>
+            <textarea
+              placeholder="Yahan apni post likho..."
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+            />
+            <div className="count">{text.length} characters</div>
+
+            <h3 style={box}>Description (sab ke liye, zaroori)</h3>
+            <textarea
+              placeholder="Yahan description likho (zaroori)..."
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              style={{ minHeight: 90 }}
+            />
+            <div className="count">{description.length} characters</div>
+
+            <h3 style={box}>Kis liye (note, history mein dikhega)</h3>
+            <input
+              type="text"
+              className="note-input"
+              style={{ width: '100%', padding: 10, borderRadius: 8, boxSizing: 'border-box' }}
+              placeholder="Jaise: Eid offer, naya product, event..."
+              value={purpose}
+              onChange={(e) => setPurpose(e.target.value)}
+            />
+
+            <div className="drop" style={box} onClick={choose}>
+              <div className="plus">+</div>
+              <div>
+                <b>{file ? 'File chuni gayi' : 'Photo ya Video choose karo'}</b>
+                <span>{file ? file.split('\\').pop() : 'jpg, png, mp4, mov'}</span>
+              </div>
+              {file && (
+                <button className="x" onClick={(e) => { e.stopPropagation(); setFile(null); }}>
+                  Hatao
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div className="card">
+            <h3>2. Kahan post karni hai</h3>
+            <div className="plats">
+              {NAMES.map((p) => (
+                <div
+                  key={p}
+                  className={'plat' + (platforms[p] ? ' on' : '')}
+                  style={platforms[p] ? { borderColor: COLORS[p] } : {}}
+                  onClick={() => toggle(p)}
+                >
+                  <Dot p={p} /> {p}
+                  <span className="tick">{platforms[p] ? '\u2713' : ''}</span>
+                </div>
+              ))}
+            </div>
+            {missingFile.length > 0 && (
+              <div className="warn">
+                {missingFile.join(', ')} ke liye photo/video zaroori hai. Pehle file choose karein.
+              </div>
+            )}
+
+            {selected.length > 0 && (
+              <div style={box}>
+                <h3>Har platform ki alag description (zaroori nahi)</h3>
+                <span className="small">Khali chhodein to upar wali description lagegi.</span>
+                {selected.map((p) => (
+                  <div key={p} style={{ marginTop: 10 }}>
+                    <div><Dot p={p} /> <b>{p}</b></div>
+                    <textarea
+                      placeholder={'Sirf ' + p + ' ke liye alag description...'}
+                      value={descs[p] || ''}
+                      onChange={(e) => setDescs({ ...descs, [p]: e.target.value })}
+                      style={{ minHeight: 70 }}
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="card">
+            <h3>3. Kab post karni hai</h3>
+            <div className="chips">
+              <button
+                className="chip"
+                style={mode === 'now' ? { background: '#0d9488', color: '#fff' } : {}}
+                onClick={() => setMode('now')}
+              >Abhi post karo</button>
+              <button
+                className="chip"
+                style={mode === 'later' ? { background: '#0d9488', color: '#fff' } : {}}
+                onClick={() => { setMode('later'); if (!whenStr) setWhenStr(toLocalInput(new Date(Date.now() + 60 * 60 * 1000))); }}
+              >Baad mein (schedule)</button>
+            </div>
+            {mode === 'later' && (
+              <div style={box}>
+                <input
+                  type="datetime-local"
+                  value={whenStr}
+                  min={toLocalInput(new Date())}
+                  onChange={(e) => setWhenStr(e.target.value)}
+                  style={{ padding: 10, borderRadius: 8 }}
+                />
+                {!whenOk && <div className="warn">Aane wala waqt chunein.</div>}
+                <div className="small" style={{ marginTop: 8 }}>
+                  Schedule tab hi chalegi jab app khuli ho aur PC on ho.
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="card">
+            <label className="toggle-row">
+              <input type="checkbox" checked={testMode} onChange={(e) => setTestMode(e.target.checked)} />
+              <span>
+                <b>Test mode</b> {testMode ? '(ON: asli post nahi hogi)' : '(OFF: asli post hogi!)'}
+              </span>
+            </label>
+          </div>
+
+          <button
+            className="btn-main"
+            style={{ padding: 16, fontSize: 17 }}
+            disabled={!canPost}
+            onClick={submit}
+          >
+            {loading ? 'Intezar karein...'
+              : mode === 'later' ? 'Schedule Karo'
+              : testMode ? 'Test Karo (post nahi hogi)' : 'Post Karo'}
+          </button>
+
+          {results.length > 0 && (
+            <div className="card results" style={{ marginTop: 16 }}>
+              <h3>Natija</h3>
+              {results.map((r, i) => (
+                <div key={i} className={'row ' + (r.loading ? 'load' : r.ok ? 'ok' : 'bad')}>
+                  <span className="badge">{r.loading ? '...' : r.ok ? 'OK' : 'X'}</span>
+                  <span>{r.message}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <details className="card login-card" style={{ marginTop: 16 }}>
+            <summary>Login (zarurat par kholein)</summary>
+            <button className="btn-main" style={{ marginTop: 12 }} onClick={() => window.api.loginAll()}>
+              Sab login karo (ek ke baad ek)
+            </button>
+            {loginMsg && <div className="login-msg">{loginMsg}</div>}
+            <span className="small">Ya alag alag login karein:</span>
+            <div className="chips">
+              {NAMES.map((p) => (
+                <button key={p} className="chip" onClick={() => window.api.openSite(p)}>
+                  <Dot p={p} /> {p}
+                </button>
+              ))}
+            </div>
+          </details>
+        </>
+      )}
+
+      {tab === 'scheduled' && (
+        <div className="card">
+          <h3>Schedule hui posts</h3>
+          {scheduled.length === 0 && <div className="small">Koi schedule hui post nahi hai.</div>}
+          {scheduled.map((j) => (
+            <div key={j.id} className={'row ' + (j.status === 'missed' ? 'bad' : 'load')} style={{ display: 'block', marginBottom: 10 }}>
+              <div>
+                <b>{typeLabel(j.postType)}</b> &rarr; {j.platforms.join(', ')}
+                {j.dryRun && ' (TEST)'}
+              </div>
+              <div className="small">
+                {j.status === 'missed' ? 'Miss ho gayi (app band thi): ' : 'Waqt: '}{fmt(j.when)}
+              </div>
+              {j.purpose && <div className="small">Kis liye: {j.purpose}</div>}
+              <div className="small">{(j.text || '').slice(0, 80)}</div>
+              <div className="chips" style={{ marginTop: 6 }}>
+                {j.status === 'missed' && (
+                  <button className="chip" onClick={() => postMissedNow(j)}>Abhi post karo</button>
+                )}
+                <button className="chip" onClick={() => updateScheduled((prev) => prev.filter((x) => x.id !== j.id))}>
+                  Hatao
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {tab === 'history' && (
+        <div className="card">
+          <div className="chips" style={{ justifyContent: 'space-between' }}>
+            <h3>History</h3>
+            {history.length > 0 && (
+              <button
+                className="chip"
+                onClick={() => {
+                  if (window.confirm('Poori history delete karni hai?')) { setHistory([]); save(H_KEY, []); }
+                }}
+              >History saaf karo</button>
+            )}
+          </div>
+          {history.length === 0 && <div className="small">Abhi koi history nahi hai.</div>}
+          {history.map((h) => (
+            <div key={h.id} className={'row ' + (h.ok ? 'ok' : 'bad')} style={{ display: 'block', marginBottom: 10 }}>
+              <div>
+                <Dot p={h.platform} /> <b>{h.platform}</b> &middot; {typeLabel(h.postType)}
+                {h.dryRun && ' (TEST)'} &middot; {h.ok ? 'OK' : 'Fail'}
+              </div>
+              <div className="small">
+                Kab: {fmt(h.postedAt)}
+                {h.scheduledFor ? ' (schedule: ' + fmt(h.scheduledFor) + ')' : ''}
+              </div>
+              {h.purpose && <div className="small">Kis liye: {h.purpose}</div>}
+              <div className="small">Post: {(h.text || '').slice(0, 80)}</div>
+              <div className="small">Description: {(h.description || '').slice(0, 80)}</div>
+              {!h.ok && <div className="small">{h.message}</div>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

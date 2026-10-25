@@ -1,0 +1,245 @@
+﻿
+import { useState, useEffect, useRef } from 'react';
+import PreviewCarousel from './PreviewCarousel'
+
+const NAMES = ['facebook', 'instagram', 'tiktok', 'youtube', 'whatsapp'];
+const isVid = (p) => /\.(mp4|mov|webm|mkv|avi|m4v)$/i.test(p || '');
+const LBL = { waiting: 'Waiting', uploading: 'Uploading...', done: 'Done', failed: 'Failed' };
+
+export default function MultiPost({ Dot, Media, addHistory }) {
+  const [items, setItems] = useState([]);
+  const [description, setDescription] = useState('');
+  const [purpose, setPurpose] = useState('');
+  const [platforms, setPlatforms] = useState({
+    facebook: false, instagram: false, tiktok: false, youtube: false, whatsapp: false,
+  });
+  const [testMode, setTestMode] = useState(true);
+  const [running, setRunning] = useState(false);
+  const [carousel, setCarousel] = useState(false);
+  const [music, setMusic] = useState(null);
+const pickMusic = async () => {
+  const f = await window.api.pickMusic();
+  if (f) setMusic({ file: f, volume: 0.25 });
+};
+  const idxRef = useRef([]);
+
+  useEffect(() => {
+    window.api.onBatchProgress((m) => {
+      const i = idxRef.current[m.index];
+      if (i === undefined) return;
+      const st = m.status === 'done' && !(m.results && m.results.length) ? 'failed' : m.status;
+      setItems((prev) => prev.map((it, k) => (k === i ? { ...it, status: st, results: m.results || it.results } : it)));
+    });
+  }, []);
+
+  const selected = NAMES.filter((p) => platforms[p]);
+  const canRun = !running && items.length > 0 && selected.length > 0 && description.trim().length > 0
+    && (testMode || items.some((it) => it.status !== 'done'));
+  const hasFailed = items.some((it) => it.status === 'failed');
+
+  const pick = async () => {
+    const fs = await window.api.pickFiles();
+    if (fs && fs.length) {
+      setItems((prev) => [
+        ...prev,
+        ...fs.filter((f) => !prev.some((x) => x.file === f)).map((f) => ({ file: f, text: '', status: 'waiting' })),
+      ]);
+    }
+  };
+
+    const runCarousel = async () => {
+    const cps = selected.slice();
+    if (!cps.length) { window.alert('Carousel ke liye kam az kam ek platform select karein'); return; }
+    if (items.length < 2) { window.alert('Carousel ke liye kam az kam 2 files choose karein'); return; }
+    if (items.length > 10) { window.alert('Carousel me max 10 files ho sakti hain'); return; }
+    const mixedOk = cps.filter((p) => p === 'instagram' || p === 'whatsapp');
+    const photoOnly = cps.filter((p) => !mixedOk.includes(p));
+    const photos = items.filter((x) => !isVid(x.file));
+    const videos = items.filter((x) => isVid(x.file));
+    const payload = [];
+    if (mixedOk.length) payload.push({ file: items[0].file, files: items.map((x) => x.file), text: items[0].text, platforms: mixedOk });
+    if (photoOnly.length) {
+      if (photos.length) payload.push({ file: photos[0].file, files: photos.map((x) => x.file), text: photos[0].text, platforms: photoOnly });
+      videos.forEach((v) => payload.push({ file: v.file, files: [v.file], text: v.text, platforms: photoOnly }));
+    }
+    if (!payload.length) return;
+    if (!testMode && !window.confirm('Live post hone wali hai!\n\n' + payload.length + ' post(s) bangi -> ' + cps.join(', ') + '\n\nPublish karein?')) return;
+    idxRef.current = [];
+    setRunning(true);
+    setItems((prev) => prev.map((it) => ({ ...it, status: 'uploading', results: null })));
+    let res = null;
+    try {
+      res = await window.api.postBatch({ items: payload, description, platforms: cps, dryRun: testMode });
+    } catch (e) { res = null; }
+    const outs = (res && res.items) || [];
+    const all = [];
+    outs.forEach((o) => (o.results || []).forEach((r, k) => all.push({
+      r, p: payload[o.index].platforms[k] || 'instagram', file: payload[o.index].file,
+      text: payload[o.index].text, n: payload[o.index].files.length,
+    })));
+    const ok = outs.length === payload.length && all.length > 0 && all.every((x) => x.r.ok);
+    setItems((prev) => prev.map((it) => ({ ...it, status: ok ? 'done' : 'failed', results: all.map((x) => x.r) })));
+    if (all.length) {
+      addHistory(all.map((x, k) => ({
+        id: 'c' + Date.now() + '-' + k, platform: x.p, postType: isVid(x.file) ? 'reel' : 'post',
+        purpose: purpose.trim(), text: x.text, description, file: x.file,
+        ok: !!x.r.ok, message: x.r.message + (x.n > 1 ? ' (carousel, ' + x.n + ' files)' : ''),
+        postedAt: new Date().toISOString(), scheduledFor: null, dryRun: testMode,
+      })));
+    }
+    setRunning(false);
+  };
+
+  const runCarouselOld = async () => {
+    const cps = selected.slice();
+    if (!cps.length) { window.alert('Carousel ke liye kam az kam ek platform select karein'); return; }
+    if (items.length < 2) { window.alert('Carousel ke liye kam az kam 2 files choose karein'); return; }
+    if (items.length > 10) { window.alert('Instagram carousel me max 10 files ho sakti hain'); return; }
+    if (!testMode && !window.confirm('Live carousel post hone wali hai!\n\n' + items.length + ' files -> Instagram (1 post)\n\nPublish karein?')) return;
+    idxRef.current = [];
+    setRunning(true);
+    setItems((prev) => prev.map((it) => ({ ...it, status: 'uploading', results: null })));
+    let res = null;
+    try {
+      res = await window.api.postBatch({
+        items: [{ file: items[0].file, files: items.map((x) => x.file), text: items[0].text, platforms: cps }],
+        description, platforms: cps, dryRun: testMode,
+      });
+    } catch (e) { res = null; }
+    const o = res && res.items && res.items[0];
+    const results = (o && o.results) || [];
+    const ok = !!o && o.ok && results.length > 0;
+    setItems((prev) => prev.map((it) => ({ ...it, status: ok ? 'done' : 'failed', results })));
+    if (results.length) {
+      addHistory(results.map((r, k) => ({
+        id: 'c' + Date.now() + '-' + k, platform: cps[k] || 'instagram', postType: 'post',
+        purpose: purpose.trim(), text: items[0].text, description, file: items[0].file,
+        ok: !!r.ok, message: r.message + ' (carousel, ' + items.length + ' files)',
+        postedAt: new Date().toISOString(), scheduledFor: null, dryRun: testMode,
+      })));
+    }
+    setRunning(false);
+  };
+
+  const run = async (onlyFailed) => {
+    const idx = items.map((_, i) => i).filter((i) => (onlyFailed ? items[i].status === 'failed' : (testMode || items[i].status !== 'done')));
+    if (!idx.length) return;
+    if (!testMode && !window.confirm('Live post hone wali hai!\n\n' + idx.length + ' item(s) -> ' + selected.join(', ') + '\n\nPublish karein?')) return;
+    const payload = idx.map((i) => ({
+      file: items[i].file,
+      text: items[i].text,
+      platforms: selected.filter((p) => !(p === 'youtube' && !isVid(items[i].file))),
+    }));
+    idxRef.current = idx;
+    setItems((prev) => prev.map((it, i) => (idx.includes(i) ? { ...it, status: 'waiting', results: null } : it)));
+    setRunning(true);
+    let res = null;
+    try {
+      res = await window.api.postBatch({ items: payload, description, platforms: selected, dryRun: testMode });
+    } catch (e) {
+      res = null;
+    }
+    if (res && res.items) {
+      const entries = [];
+      res.items.forEach((o) => {
+        const i = idx[o.index];
+        const it = items[i];
+        const pl = payload[o.index].platforms;
+        (o.results || []).forEach((r, k) => entries.push({
+          id: 'b' + Date.now() + '-' + i + '-' + k,
+          platform: pl[k] || pl[0] || 'facebook',
+          postType: isVid(it.file) ? 'reel' : 'post',
+          purpose: purpose.trim(), text: it.text, description, file: it.file,
+          ok: !!r.ok, message: r.message,
+          postedAt: new Date().toISOString(), scheduledFor: null, dryRun: testMode,
+        }));
+      });
+      if (entries.length) addHistory(entries);
+    } else {
+      setItems((prev) => prev.map((it, i) => (idx.includes(i) ? { ...it, status: 'failed' } : it)));
+    }
+    setRunning(false);
+  };
+
+  return (
+    <div style={{ maxWidth: 900 }}>
+      <div className="card">
+        <h2>Multiple Post</h2>
+        <p className="sub">Ek sath 6-7 photos/videos choose karein. Har ek alag post banegi, ek ek karke.</p>
+        <div className="drop" onClick={pick}>
+          <div className="thumb" />
+          <div><b>Files choose karein</b><small>{items.length} selected (jpg, png, mp4, mov)</small></div>
+        </div>
+        {items.map((it, i) => (
+          <div key={it.file} className={'item ' + (it.status === 'failed' ? 'bad' : '')}>
+            <Media path={it.file} />
+            <div className="grow">
+              <div className="who">
+                <b>{i + 1}. {it.file.split('\\').pop()}</b>
+                <span className={'kindtag ' + (it.status === 'done' ? 'okt' : it.status === 'failed' ? 'badt' : '')}>{LBL[it.status]}</span>
+              </div>
+              <input
+                type="text" className="in" placeholder="Is item ka caption (optional)" value={it.text}
+                disabled={running}
+                onChange={(e) => { const v = e.target.value; setItems((prev) => prev.map((x, k) => (k === i ? { ...x, text: v } : x))); }}
+              />
+              {it.status === 'failed' && it.results && (
+                <small className="err">{it.results.filter((r) => !r.ok).map((r) => r.message).join(' | ')}</small>
+              )}
+            </div>
+            <div className="acts">
+              <button className="mini del" disabled={running} onClick={() => setItems((prev) => prev.filter((_, k) => k !== i))}>Remove</button>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="card">
+        <h2>Description <em>*</em></h2>
+        <p className="sub">Sab items ke liye same, required.</p>
+        <textarea className="in sm" placeholder="Description..." value={description} onChange={(e) => setDescription(e.target.value)} />
+        <div className="stack" style={{ marginTop: 12 }}>
+          <input type="text" className="in" placeholder="Purpose (note, history mein dikhega)" value={purpose} onChange={(e) => setPurpose(e.target.value)} />
+        </div>
+      </div>
+
+      <div className="card">
+        <h2>Where would you like to post?</h2>
+        <div className="plats">
+          {NAMES.map((p) => (
+            <div key={p} className={'plat' + (platforms[p] ? ' on' : '')} onClick={() => setPlatforms({ ...platforms, [p]: !platforms[p] })}>
+              <Dot p={p} />{p}
+            </div>
+          ))}
+        </div>
+        {platforms.youtube && items.some((it) => !isVid(it.file)) && (
+          <div className="warn">YouTube sirf video leta hai, photos YouTube pe skip hongi.</div>
+        )}
+        <label className="tg">
+          <input type="checkbox" checked={carousel} onChange={(e) => setCarousel(e.target.checked)} />
+          <span className="sw" />
+          <span><b>Carousel (1 post, sab platforms)</b><small>{carousel ? 'ON: sab files ek hi post me' : 'OFF: har file alag post'}</small></span>
+        </label>
+        {carousel && <PreviewCarousel paths={items.map((x) => x.file)} />}
+        {carousel && <div className="warn">Instagram/WhatsApp: sab files ek post me. Facebook/TikTok: photos ek carousel me, videos alag post. YouTube: photos ka slideshow video, videos alag.</div>}
+        
+        {carousel && (
+          <button className="go" disabled={running || items.length < 2 || !description.trim()} onClick={runCarousel}>
+            {running ? 'Posting... (window band na karein)' : testMode ? 'Run Carousel Test' : 'Publish Carousel (' + items.length + ' files)'}
+          </button>
+        )}
+        <label className="tg">
+          <input type="checkbox" checked={testMode} onChange={(e) => setTestMode(e.target.checked)} />
+          <span className="sw" />
+          <span><b>Test mode</b><small>{testMode ? 'ON: asli post nahi hogi' : 'OFF: live post hogi!'}</small></span>
+        </label>
+        <button className="go" disabled={!canRun || carousel} onClick={() => run(false)}>
+          {running ? 'Posting... (window band na karein)' : testMode ? 'Run Test (' + items.length + ' items)' : 'Publish All (' + items.length + ' items)'}
+        </button>
+        {hasFailed && !running && (
+          <button className="mini" style={{ marginTop: 10 }} onClick={() => run(true)}>Sirf failed wale dobara try karein</button>
+        )}
+      </div>
+    </div>
+  );
+}

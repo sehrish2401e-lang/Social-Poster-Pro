@@ -1,0 +1,134 @@
+﻿import { useState, useEffect } from 'react';
+import './App.css';
+
+const NAMES = ['facebook', 'instagram', 'tiktok', 'youtube', 'whatsapp'];
+const COLORS = {
+  facebook: '#1877f2', instagram: '#e1306c', tiktok: '#111111',
+  youtube: '#ff0000', whatsapp: '#25d366',
+};
+
+export default function App() {
+  const [text, setText] = useState('');
+  const [file, setFile] = useState(null);
+  const [platforms, setPlatforms] = useState({
+    facebook: true, instagram: false, tiktok: true, youtube: false, whatsapp: false,
+  });
+  const [results, setResults] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [loginMsg, setLoginMsg] = useState('');
+
+  useEffect(() => {
+    window.api.onLoginStep((m) => setLoginMsg(m));
+  }, []);
+
+  const toggle = (name) => setPlatforms({ ...platforms, [name]: !platforms[name] });
+
+  const choose = async () => {
+    const f = await window.api.pickFile();
+    if (f) setFile(f);
+  };
+
+  const handlePost = async () => {
+    const selected = Object.keys(platforms).filter((p) => platforms[p]);
+    if (!selected.length) {
+      setResults([{ ok: false, message: 'Kam az kam ek platform tick karein' }]);
+      return;
+    }
+    setLoading(true);
+    setResults([{ loading: true, message: 'Post ho rahi hai... app ki nayi window khulegi, kuch na dabayein' }]);
+    try {
+      const res = await window.api.postAll({ text, file, platforms: selected });
+      setResults(res.results);
+    } catch (e) {
+      setResults([{ ok: false, message: 'Error: ' + e.message }]);
+    }
+    setLoading(false);
+  };
+
+  const Dot = ({ p }) => (
+    <span className="dot" style={{ background: COLORS[p] }}>{p[0]}</span>
+  );
+
+  return (
+    <div className="wrap">
+      <div className="header">
+        <div className="logo">SP</div>
+        <h1>Social Poster</h1>
+        <p>Ek post likho, sab jagah lagao</p>
+      </div>
+
+      <div className="card">
+        <h3>1. Login</h3>
+        <button className="btn-main" onClick={() => window.api.loginAll()}>
+          Sab login karo (ek ke baad ek)
+        </button>
+        {loginMsg && <div className="login-msg">{loginMsg}</div>}
+        <span className="small">Ya alag alag login karein:</span>
+        <div className="chips">
+          {NAMES.map((p) => (
+            <button key={p} className="chip" onClick={() => window.api.openSite(p)}>
+              <Dot p={p} /> {p}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="card">
+        <h3>2. Post likho</h3>
+        <textarea
+          placeholder="Yahan apni post likho..."
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+        />
+        <div className="count">{text.length} characters</div>
+
+        <div className="drop" onClick={choose}>
+          <div className="plus">+</div>
+          <div>
+            <b>{file ? 'File chuni gayi' : 'Photo ya Video choose karo'}</b>
+            <span>{file ? file.split('\\').pop() : 'jpg, png, mp4, mov'}</span>
+          </div>
+          {file && (
+            <button className="x" onClick={(e) => { e.stopPropagation(); setFile(null); }}>
+              Hatao
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="card">
+        <h3>3. Kahan post karni hai</h3>
+        <div className="plats">
+          {NAMES.map((p) => (
+            <div
+              key={p}
+              className={'plat' + (platforms[p] ? ' on' : '')}
+              style={platforms[p] ? { borderColor: COLORS[p] } : {}}
+              onClick={() => toggle(p)}
+            >
+              <Dot p={p} /> {p}
+              <span className="tick">{platforms[p] ? '\u2713' : ''}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <button className="btn-main" style={{ padding: 16, fontSize: 17 }} disabled={loading} onClick={handlePost}>
+        {loading ? 'Post ho rahi hai...' : 'Post Karo'}
+      </button>
+
+      {results.length > 0 && (
+        <div className="card results" style={{ marginTop: 16 }}>
+          <h3>Natija</h3>
+          {results.map((r, i) => (
+            <div key={i} className={'row ' + (r.loading ? 'load' : r.ok ? 'ok' : 'bad')}>
+              <span className="badge">{r.loading ? '...' : r.ok ? 'OK' : 'X'}</span>
+              <span>{r.message}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
